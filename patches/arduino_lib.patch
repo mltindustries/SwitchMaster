@@ -1,0 +1,5311 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2518b0be..150ec404 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -135,6 +135,8 @@ set(LIBRARY_SRCS
+   libraries/WiFi/src/WiFiUdp.cpp
+   libraries/WiFiProv/src/WiFiProv.cpp
+   libraries/Wire/src/Wire.cpp
++  libraries/OneWire/OneWire.cpp
++  libraries/DallasTemperature/DallasTemperature.cpp
+   )
+ 
+ set(BLE_SRCS
+@@ -204,6 +206,9 @@ set(includedirs
+   libraries/WiFi/src
+   libraries/WiFiProv/src
+   libraries/Wire/src
++  libraries/OneWire
++  libraries/OneWire/util
++  libraries/DallasTemperature
+   )
+ 
+ set(srcs ${CORE_SRCS} ${LIBRARY_SRCS} ${BLE_SRCS})
+diff --git a/libraries/DallasTemperature/.arduino-ci.yml b/libraries/DallasTemperature/.arduino-ci.yml
+new file mode 100644
+index 00000000..cbdcfdcb
+--- /dev/null
++++ b/libraries/DallasTemperature/.arduino-ci.yml
+@@ -0,0 +1,15 @@
++compile:
++  # Choosing to run compilation tests on 2 different Arduino platforms
++  platforms:
++    - uno
++    - due
++    # - zero         # SAMD covered by M4
++    # - leonardo     # AVR covered by UNO
++    - m4
++    # - esp32        # errors on OneWire =>  util/crc16.h  vs  rom/crc.h
++    - esp8266
++    # - mega2560     # AVR covered by UNO
++unittest:
++  # These dependent libraries will be installed
++  libraries:
++    - "OneWire"
+diff --git a/libraries/DallasTemperature/.gitattributes b/libraries/DallasTemperature/.gitattributes
+new file mode 100644
+index 00000000..57798ba5
+--- /dev/null
++++ b/libraries/DallasTemperature/.gitattributes
+@@ -0,0 +1 @@
++*	text=auto
+diff --git a/libraries/DallasTemperature/.github/workflows/arduino-lint.yml b/libraries/DallasTemperature/.github/workflows/arduino-lint.yml
+new file mode 100644
+index 00000000..5a84495a
+--- /dev/null
++++ b/libraries/DallasTemperature/.github/workflows/arduino-lint.yml
+@@ -0,0 +1,13 @@
++
++name: Arduino-lint
++
++on: [push, pull_request]
++jobs:
++  lint:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v2
++      - uses: arduino/arduino-lint-action@v1
++        with:
++          library-manager: update
++          # compliance: strict
+diff --git a/libraries/DallasTemperature/.github/workflows/arduino_test_runner.yml b/libraries/DallasTemperature/.github/workflows/arduino_test_runner.yml
+new file mode 100644
+index 00000000..096b975b
+--- /dev/null
++++ b/libraries/DallasTemperature/.github/workflows/arduino_test_runner.yml
+@@ -0,0 +1,17 @@
++---
++name: Arduino CI
++
++on: [push, pull_request]
++
++jobs:
++  runTest:
++    runs-on: ubuntu-latest
++
++    steps:
++      - uses: actions/checkout@v2
++      - uses: ruby/setup-ruby@v1
++        with:
++          ruby-version: 2.6
++      - run: |
++          gem install arduino_ci
++          arduino_ci.rb
+diff --git a/libraries/DallasTemperature/.github/workflows/jsoncheck.yml b/libraries/DallasTemperature/.github/workflows/jsoncheck.yml
+new file mode 100644
+index 00000000..04603d08
+--- /dev/null
++++ b/libraries/DallasTemperature/.github/workflows/jsoncheck.yml
+@@ -0,0 +1,18 @@
++name: JSON check
++
++on:
++  push:
++    paths:
++      - '**.json'
++  pull_request:
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v2
++      - name: json-syntax-check
++        uses: limitusus/json-syntax-check@v1
++        with:
++          pattern: "\\.json$"
++
+diff --git a/libraries/DallasTemperature/.gitignore b/libraries/DallasTemperature/.gitignore
+new file mode 100644
+index 00000000..75c20acf
+--- /dev/null
++++ b/libraries/DallasTemperature/.gitignore
+@@ -0,0 +1,16 @@
++.idea
++classes
++target
++out
++build
++*.iml
++*.ipr
++*.iws
++*.log
++*.war
++.idea
++.project
++.classpath
++.settings
++.gradle
++.vscode
+diff --git a/libraries/DallasTemperature/.piopm b/libraries/DallasTemperature/.piopm
+new file mode 100644
+index 00000000..1e39f171
+--- /dev/null
++++ b/libraries/DallasTemperature/.piopm
+@@ -0,0 +1 @@
++{"type": "library", "name": "DallasTemperature", "version": "3.11.0", "spec": {"owner": "milesburton", "id": 54, "name": "DallasTemperature", "requirements": null, "uri": null}}
+\ No newline at end of file
+diff --git a/libraries/DallasTemperature/DallasTemperature.cpp b/libraries/DallasTemperature/DallasTemperature.cpp
+new file mode 100644
+index 00000000..13c06143
+--- /dev/null
++++ b/libraries/DallasTemperature/DallasTemperature.cpp
+@@ -0,0 +1,1122 @@
++// This library is free software; you can redistribute it and/or
++// modify it under the terms of the GNU Lesser General Public
++// License as published by the Free Software Foundation; either
++// version 2.1 of the License, or (at your option) any later version.
++
++#include "DallasTemperature.h"
++
++// for Particle support
++// yield() is not a standard function, but instead wraps Particle process
++// https://community.particle.io/t/syscall-yield-operation/40708/2
++#if defined(PLATFORM_ID)  // Only defined if a Particle device
++inline void yield() {
++	Particle.process();
++}
++#elif ARDUINO >= 100
++#include "Arduino.h"
++#else
++extern "C" {
++#include "WConstants.h"
++}
++#endif
++
++// OneWire commands
++#define STARTCONVO      0x44  // Tells device to take a temperature reading and put it on the scratchpad
++#define COPYSCRATCH     0x48  // Copy scratchpad to EEPROM
++#define READSCRATCH     0xBE  // Read from scratchpad
++#define WRITESCRATCH    0x4E  // Write to scratchpad
++#define RECALLSCRATCH   0xB8  // Recall from EEPROM to scratchpad
++#define READPOWERSUPPLY 0xB4  // Determine if device needs parasite power
++#define ALARMSEARCH     0xEC  // Query bus for devices with an alarm condition
++
++// Scratchpad locations
++#define TEMP_LSB        0
++#define TEMP_MSB        1
++#define HIGH_ALARM_TEMP 2
++#define LOW_ALARM_TEMP  3
++#define CONFIGURATION   4
++#define INTERNAL_BYTE   5
++#define COUNT_REMAIN    6
++#define COUNT_PER_C     7
++#define SCRATCHPAD_CRC  8
++
++// DSROM FIELDS
++#define DSROM_FAMILY    0
++#define DSROM_CRC       7
++
++// Device resolution
++#define TEMP_9_BIT  0x1F //  9 bit
++#define TEMP_10_BIT 0x3F // 10 bit
++#define TEMP_11_BIT 0x5F // 11 bit
++#define TEMP_12_BIT 0x7F // 12 bit
++
++#define MAX_CONVERSION_TIMEOUT		750
++
++// Alarm handler
++#define NO_ALARM_HANDLER ((AlarmHandler *)0)
++
++
++DallasTemperature::DallasTemperature() {
++#if REQUIRESALARMS
++	setAlarmHandler(NO_ALARM_HANDLER);
++#endif
++	useExternalPullup = false;
++}
++
++DallasTemperature::DallasTemperature(OneWire* _oneWire) : DallasTemperature() {
++	setOneWire(_oneWire);
++}
++
++bool DallasTemperature::validFamily(const uint8_t* deviceAddress) {
++	switch (deviceAddress[DSROM_FAMILY]) {
++	case DS18S20MODEL:
++	case DS18B20MODEL:
++	case DS1822MODEL:
++	case DS1825MODEL:
++	case DS28EA00MODEL:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/*
++ * Constructs DallasTemperature with strong pull-up turned on. Strong pull-up is mandated in DS18B20 datasheet for parasitic
++ * power (2 wires) setup. (https://datasheets.maximintegrated.com/en/ds/DS18B20.pdf, p. 7, section 'Powering the DS18B20').
++ */
++DallasTemperature::DallasTemperature(OneWire* _oneWire, uint8_t _pullupPin) : DallasTemperature(_oneWire) {
++	setPullupPin(_pullupPin);
++}
++
++void DallasTemperature::setPullupPin(uint8_t _pullupPin) {
++	useExternalPullup = true;
++	pullupPin = _pullupPin;
++	pinMode(pullupPin, OUTPUT);
++	deactivateExternalPullup();
++}
++
++void DallasTemperature::setOneWire(OneWire* _oneWire) {
++
++	_wire = _oneWire;
++	devices = 0;
++	ds18Count = 0;
++	parasite = false;
++	bitResolution = 9;
++	waitForConversion = true;
++	checkForConversion = true;
++	autoSaveScratchPad = true;
++
++}
++
++// initialise the bus
++void DallasTemperature::begin(void) {
++
++	DeviceAddress deviceAddress;
++
++	_wire->reset_search();
++	devices = 0; // Reset the number of devices when we enumerate wire devices
++	ds18Count = 0; // Reset number of DS18xxx Family devices
++
++	while (_wire->search(deviceAddress)) {
++
++		if (validAddress(deviceAddress)) {
++			devices++;
++
++			if (validFamily(deviceAddress)) {
++				ds18Count++;
++
++				if (!parasite && readPowerSupply(deviceAddress))
++					parasite = true;
++
++				uint8_t b = getResolution(deviceAddress);
++				if (b > bitResolution) bitResolution = b;
++			}
++		}
++	}
++}
++
++// returns the number of devices found on the bus
++uint8_t DallasTemperature::getDeviceCount(void) {
++	return devices;
++}
++
++uint8_t DallasTemperature::getDS18Count(void) {
++	return ds18Count;
++}
++
++// returns true if address is valid
++bool DallasTemperature::validAddress(const uint8_t* deviceAddress) {
++	return (_wire->crc8((uint8_t*)deviceAddress, 7) == deviceAddress[DSROM_CRC]);
++}
++
++// finds an address at a given index on the bus
++// returns true if the device was found
++bool DallasTemperature::getAddress(uint8_t* deviceAddress, uint8_t index) {
++
++	uint8_t depth = 0;
++
++	_wire->reset_search();
++
++	while (depth <= index && _wire->search(deviceAddress)) {
++		if (depth == index && validAddress(deviceAddress))
++			return true;
++		depth++;
++	}
++
++	return false;
++
++}
++
++// attempt to determine if the device at the given address is connected to the bus
++bool DallasTemperature::isConnected(const uint8_t* deviceAddress) {
++
++	ScratchPad scratchPad;
++	return isConnected(deviceAddress, scratchPad);
++
++}
++
++// attempt to determine if the device at the given address is connected to the bus
++// also allows for updating the read scratchpad
++bool DallasTemperature::isConnected(const uint8_t* deviceAddress,
++                                    uint8_t* scratchPad) {
++	bool b = readScratchPad(deviceAddress, scratchPad);
++	return b && !isAllZeros(scratchPad) && (_wire->crc8(scratchPad, 8) == scratchPad[SCRATCHPAD_CRC]);
++}
++
++bool DallasTemperature::readScratchPad(const uint8_t* deviceAddress,
++                                       uint8_t* scratchPad) {
++
++	// send the reset command and fail fast
++	int b = _wire->reset();
++	if (b == 0)
++		return false;
++
++	_wire->select(deviceAddress);
++	_wire->write(READSCRATCH);
++
++	// Read all registers in a simple loop
++	// byte 0: temperature LSB
++	// byte 1: temperature MSB
++	// byte 2: high alarm temp
++	// byte 3: low alarm temp
++	// byte 4: DS18S20: store for crc
++	//         DS18B20 & DS1822: configuration register
++	// byte 5: internal use & crc
++	// byte 6: DS18S20: COUNT_REMAIN
++	//         DS18B20 & DS1822: store for crc
++	// byte 7: DS18S20: COUNT_PER_C
++	//         DS18B20 & DS1822: store for crc
++	// byte 8: SCRATCHPAD_CRC
++	for (uint8_t i = 0; i < 9; i++) {
++		scratchPad[i] = _wire->read();
++	}
++
++	b = _wire->reset();
++	return (b == 1);
++}
++
++void DallasTemperature::writeScratchPad(const uint8_t* deviceAddress,
++                                        const uint8_t* scratchPad) {
++
++	_wire->reset();
++	_wire->select(deviceAddress);
++	_wire->write(WRITESCRATCH);
++	_wire->write(scratchPad[HIGH_ALARM_TEMP]); // high alarm temp
++	_wire->write(scratchPad[LOW_ALARM_TEMP]); // low alarm temp
++
++	// DS1820 and DS18S20 have no configuration register
++	if (deviceAddress[DSROM_FAMILY] != DS18S20MODEL)
++		_wire->write(scratchPad[CONFIGURATION]);
++
++	if (autoSaveScratchPad)
++		saveScratchPad(deviceAddress);
++	else
++		_wire->reset();
++}
++
++// returns true if parasite mode is used (2 wire)
++// returns false if normal mode is used (3 wire)
++// if no address is given (or nullptr) it checks if any device on the bus
++// uses parasite mode.
++// See issue #145
++bool DallasTemperature::readPowerSupply(const uint8_t* deviceAddress)
++{
++	bool parasiteMode = false;
++	_wire->reset();
++	if (deviceAddress == nullptr)
++		_wire->skip();
++	else
++		_wire->select(deviceAddress);
++
++	_wire->write(READPOWERSUPPLY);
++	if (_wire->read_bit() == 0)
++		parasiteMode = true;
++	_wire->reset();
++	return parasiteMode;
++}
++
++// set resolution of all devices to 9, 10, 11, or 12 bits
++// if new resolution is out of range, it is constrained.
++void DallasTemperature::setResolution(uint8_t newResolution) {
++
++	bitResolution = constrain(newResolution, 9, 12);
++	DeviceAddress deviceAddress;
++	_wire->reset_search();
++	for (uint8_t i = 0; i < devices; i++) {
++		if(_wire->search(deviceAddress) && validAddress(deviceAddress)) {
++			setResolution(deviceAddress, bitResolution, true);
++		}
++	}
++}
++
++/*  PROPOSAL */
++
++// set resolution of a device to 9, 10, 11, or 12 bits
++// if new resolution is out of range, 9 bits is used.
++bool DallasTemperature::setResolution(const uint8_t* deviceAddress,
++                                      uint8_t newResolution, bool skipGlobalBitResolutionCalculation) {
++
++	bool success = false;
++
++	// DS1820 and DS18S20 have no resolution configuration register
++	if (deviceAddress[DSROM_FAMILY] == DS18S20MODEL) {
++		success = true;
++	} else {
++
++		// handle the sensors with configuration register
++		newResolution = constrain(newResolution, 9, 12);
++		uint8_t newValue = 0;
++		ScratchPad scratchPad;
++
++		// we can only update the sensor if it is connected
++		if (isConnected(deviceAddress, scratchPad)) {
++			// MAX31850 has no resolution configuration register
++			// this is also a hack as the MAX31850 Coversion time is 100ms max.
++			// use a low res (~10 by spec, but 9 might work) for faster blocking read times.
++			if (deviceAddress[DSROM_FAMILY] == DS1825MODEL && scratchPad[CONFIGURATION] & 0x80 ) {
++				success = true;
++			} else {
++				switch (newResolution) {
++				case 12:
++					newValue = TEMP_12_BIT;
++					break;
++				case 11:
++					newValue = TEMP_11_BIT;
++					break;
++				case 10:
++					newValue = TEMP_10_BIT;
++					break;
++				case 9:
++				default:
++					newValue = TEMP_9_BIT;
++					break;
++				}
++
++				// if it needs to be updated we write the new value
++				if (scratchPad[CONFIGURATION] != newValue) {
++					scratchPad[CONFIGURATION] = newValue;
++					writeScratchPad(deviceAddress, scratchPad);
++				}
++				// done
++				success = true;
++			}
++		}
++	}
++
++	// do we need to update the max resolution used?
++	if (skipGlobalBitResolutionCalculation == false) {
++		bitResolution = newResolution;
++		if (devices > 1) {
++			DeviceAddress deviceAddr;
++			_wire->reset_search();
++			for (uint8_t i = 0; i < devices; i++) {
++				if (bitResolution == 12) break;
++				if (_wire->search(deviceAddr) && validAddress(deviceAddr)) {
++					uint8_t b = getResolution(deviceAddr);
++					if (b > bitResolution) bitResolution = b;
++				}
++			}
++		}
++	}
++
++	return success;
++}
++
++
++// returns the global resolution
++uint8_t DallasTemperature::getResolution() {
++	return bitResolution;
++}
++
++// returns the current resolution of the device, 9-12
++// returns 0 if device not found
++uint8_t DallasTemperature::getResolution(const uint8_t* deviceAddress) {
++
++	// DS1820 and DS18S20 have no resolution configuration register
++	if (deviceAddress[DSROM_FAMILY] == DS18S20MODEL)
++		return 12;
++
++	ScratchPad scratchPad;
++	if (isConnected(deviceAddress, scratchPad)) {
++
++		// MAX31850 has no resolution configuration register
++		if (deviceAddress[DSROM_FAMILY] == DS1825MODEL && scratchPad[CONFIGURATION] & 0x80)
++			return 12;
++
++		switch (scratchPad[CONFIGURATION]) {
++		case TEMP_12_BIT:
++			return 12;
++
++		case TEMP_11_BIT:
++			return 11;
++
++		case TEMP_10_BIT:
++			return 10;
++
++		case TEMP_9_BIT:
++			return 9;
++		}
++	}
++	return 0;
++
++}
++
++
++// sets the value of the waitForConversion flag
++// TRUE : function requestTemperature() etc returns when conversion is ready
++// FALSE: function requestTemperature() etc returns immediately (USE WITH CARE!!)
++//        (1) programmer has to check if the needed delay has passed
++//        (2) but the application can do meaningful things in that time
++void DallasTemperature::setWaitForConversion(bool flag) {
++	waitForConversion = flag;
++}
++
++// gets the value of the waitForConversion flag
++bool DallasTemperature::getWaitForConversion() {
++	return waitForConversion;
++}
++
++// sets the value of the checkForConversion flag
++// TRUE : function requestTemperature() etc will 'listen' to an IC to determine whether a conversion is complete
++// FALSE: function requestTemperature() etc will wait a set time (worst case scenario) for a conversion to complete
++void DallasTemperature::setCheckForConversion(bool flag) {
++	checkForConversion = flag;
++}
++
++// gets the value of the waitForConversion flag
++bool DallasTemperature::getCheckForConversion() {
++	return checkForConversion;
++}
++
++bool DallasTemperature::isConversionComplete() {
++	uint8_t b = _wire->read_bit();
++	return (b == 1);
++}
++
++// sends command for all devices on the bus to perform a temperature conversion
++DallasTemperature::request_t DallasTemperature::requestTemperatures() {
++	DallasTemperature::request_t req = {};
++	req.result = true;
++
++	_wire->reset();
++	_wire->skip();
++	_wire->write(STARTCONVO, parasite);
++
++	// ASYNC mode?
++	req.timestamp = millis();
++	if (!waitForConversion)
++		return req;
++	blockTillConversionComplete(bitResolution, req.timestamp);
++	return req;
++}
++
++// sends command for one device to perform a temperature by address
++// returns FALSE if device is disconnected
++// returns TRUE  otherwise
++DallasTemperature::request_t DallasTemperature::requestTemperaturesByAddress(const uint8_t* deviceAddress) {
++	DallasTemperature::request_t req = {};
++	uint8_t bitResolution = getResolution(deviceAddress);
++	if (bitResolution == 0) {
++		req.result = false;
++		return req; //Device disconnected
++	}
++
++	_wire->reset();
++	_wire->select(deviceAddress);
++	_wire->write(STARTCONVO, parasite);
++
++	req.timestamp = millis();
++	// ASYNC mode?
++	req.result = true;
++	if (!waitForConversion)
++		return req;
++
++	blockTillConversionComplete(bitResolution, req.timestamp);
++
++	return req;
++
++}
++
++// Continue to check if the IC has responded with a temperature
++void DallasTemperature::blockTillConversionComplete(uint8_t bitResolution, unsigned long start) {
++	if (checkForConversion && !parasite) {
++		while (!isConversionComplete() && (millis() - start <  MAX_CONVERSION_TIMEOUT))
++			yield();
++	} else {
++		unsigned long delms = millisToWaitForConversion(bitResolution);
++		activateExternalPullup();
++		delay(delms);
++		deactivateExternalPullup();
++	}
++
++}
++
++// Continue to check if the IC has responded with a temperature
++void DallasTemperature::blockTillConversionComplete(uint8_t bitResolution) {
++	unsigned long start = millis();
++	blockTillConversionComplete(bitResolution, start);
++}
++
++// Continue to check if the IC has responded with a temperature
++void DallasTemperature::blockTillConversionComplete(uint8_t bitResolution, DallasTemperature::request_t req) {
++	if (req.result)
++		blockTillConversionComplete(bitResolution, req.timestamp);
++}
++
++// returns number of milliseconds to wait till conversion is complete (based on IC datasheet)
++uint16_t DallasTemperature::millisToWaitForConversion(uint8_t bitResolution) {
++
++	switch (bitResolution) {
++	case 9:
++		return 94;
++	case 10:
++		return 188;
++	case 11:
++		return 375;
++	default:
++		return 750;
++	}
++
++}
++
++// returns number of milliseconds to wait till conversion is complete (based on IC datasheet)
++uint16_t DallasTemperature::millisToWaitForConversion() {
++	return millisToWaitForConversion(bitResolution);
++}
++
++// Sends command to one device to save values from scratchpad to EEPROM by index
++// Returns true if no errors were encountered, false indicates failure
++bool DallasTemperature::saveScratchPadByIndex(uint8_t deviceIndex) {
++
++	DeviceAddress deviceAddress;
++	if (!getAddress(deviceAddress, deviceIndex)) return false;
++
++	return saveScratchPad(deviceAddress);
++
++}
++
++// Sends command to one or more devices to save values from scratchpad to EEPROM
++// If optional argument deviceAddress is omitted the command is send to all devices
++// Returns true if no errors were encountered, false indicates failure
++bool DallasTemperature::saveScratchPad(const uint8_t* deviceAddress) {
++
++	if (_wire->reset() == 0)
++		return false;
++
++	if (deviceAddress == nullptr)
++		_wire->skip();
++	else
++		_wire->select(deviceAddress);
++
++	_wire->write(COPYSCRATCH, parasite);
++
++	// Specification: NV Write Cycle Time is typically 2ms, max 10ms
++	// Waiting 20ms to allow for sensors that take longer in practice
++	if (!parasite) {
++		delay(20);
++	} else {
++		activateExternalPullup();
++		delay(20);
++		deactivateExternalPullup();
++	}
++
++	return _wire->reset() == 1;
++
++}
++
++// Sends command to one device to recall values from EEPROM to scratchpad by index
++// Returns true if no errors were encountered, false indicates failure
++bool DallasTemperature::recallScratchPadByIndex(uint8_t deviceIndex) {
++
++	DeviceAddress deviceAddress;
++	if (!getAddress(deviceAddress, deviceIndex)) return false;
++
++	return recallScratchPad(deviceAddress);
++
++}
++
++// Sends command to one or more devices to recall values from EEPROM to scratchpad
++// If optional argument deviceAddress is omitted the command is send to all devices
++// Returns true if no errors were encountered, false indicates failure
++bool DallasTemperature::recallScratchPad(const uint8_t* deviceAddress) {
++
++	if (_wire->reset() == 0)
++		return false;
++
++	if (deviceAddress == nullptr)
++		_wire->skip();
++	else
++		_wire->select(deviceAddress);
++
++	_wire->write(RECALLSCRATCH, parasite);
++
++	// Specification: Strong pullup only needed when writing to EEPROM (and temp conversion)
++	unsigned long start = millis();
++	while (_wire->read_bit() == 0) {
++		// Datasheet doesn't specify typical/max duration, testing reveals typically within 1ms
++		if (millis() - start > 20) return false;
++		yield();
++	}
++
++	return _wire->reset() == 1;
++
++}
++
++// Sets the autoSaveScratchPad flag
++void DallasTemperature::setAutoSaveScratchPad(bool flag) {
++	autoSaveScratchPad = flag;
++}
++
++// Gets the autoSaveScratchPad flag
++bool DallasTemperature::getAutoSaveScratchPad() {
++	return autoSaveScratchPad;
++}
++
++void DallasTemperature::activateExternalPullup() {
++	if (useExternalPullup)
++		digitalWrite(pullupPin, LOW);
++}
++
++void DallasTemperature::deactivateExternalPullup() {
++	if (useExternalPullup)
++		digitalWrite(pullupPin, HIGH);
++}
++
++// sends command for one device to perform a temp conversion by index
++DallasTemperature::request_t DallasTemperature::requestTemperaturesByIndex(uint8_t deviceIndex) {
++
++	DeviceAddress deviceAddress;
++	getAddress(deviceAddress, deviceIndex);
++
++	return requestTemperaturesByAddress(deviceAddress);
++
++}
++
++// Fetch temperature for device index
++float DallasTemperature::getTempCByIndex(uint8_t deviceIndex) {
++
++	DeviceAddress deviceAddress;
++	if (!getAddress(deviceAddress, deviceIndex)) {
++		return DEVICE_DISCONNECTED_C;
++	}
++	return getTempC((uint8_t*) deviceAddress);
++}
++
++// Fetch temperature for device index
++float DallasTemperature::getTempFByIndex(uint8_t deviceIndex) {
++
++	DeviceAddress deviceAddress;
++
++	if (!getAddress(deviceAddress, deviceIndex)) {
++		return DEVICE_DISCONNECTED_F;
++	}
++
++	return getTempF((uint8_t*) deviceAddress);
++
++}
++
++// reads scratchpad and returns fixed-point temperature, scaling factor 2^-7
++int32_t DallasTemperature::calculateTemperature(const uint8_t* deviceAddress,
++                                                uint8_t* scratchPad) {
++
++	int32_t fpTemperature = 0;
++
++	// looking thru the spec sheets of all supported devices, bit 15 is always the signing bit
++	// Detected if signed
++	int32_t neg = 0x0;
++	if (scratchPad[TEMP_MSB] & 0x80)
++		neg = 0xFFF80000;
++
++	// detect MAX31850
++	// The temp range on a MAX31850 can far exceed other models, causing an overrun @ 256C
++	// Based on the spec sheets for the MAX31850, bit 7 is always 1
++	// Whereas the DS1825 bit 7 is always 0
++	// DS1825   - https://datasheets.maximintegrated.com/en/ds/DS1825.pdf
++	// MAX31850 - https://datasheets.maximintegrated.com/en/ds/MAX31850-MAX31851.pdf
++
++	if (deviceAddress[DSROM_FAMILY] == DS1825MODEL && scratchPad[CONFIGURATION] & 0x80 ) {
++		//Serial.print("  Detected MAX31850");
++		if (scratchPad[TEMP_LSB] & 1) { // Fault Detected
++			if (scratchPad[HIGH_ALARM_TEMP] & 1) {
++				//Serial.println("open detected");
++				return DEVICE_FAULT_OPEN_RAW;
++			}
++			else if (scratchPad[HIGH_ALARM_TEMP] >> 1 & 1) {
++				//Serial.println("short to ground detected");
++				return DEVICE_FAULT_SHORTGND_RAW;
++			}
++			else if (scratchPad[HIGH_ALARM_TEMP] >> 2 & 1) {
++				//Serial.println("short to Vdd detected");
++				return DEVICE_FAULT_SHORTVDD_RAW;
++			}
++			else {
++				// We don't know why there's a fault, exit with disconnect value
++				return DEVICE_DISCONNECTED_RAW;
++			}
++		}
++		// We must mask out bit 1 (reserved) and 0 (fault) on TEMP_LSB
++		fpTemperature = (((int32_t) scratchPad[TEMP_MSB]) << 11)
++		                | (((int32_t) scratchPad[TEMP_LSB] & 0xFC) << 3)
++		                | neg;
++	} else {
++		fpTemperature = (((int16_t) scratchPad[TEMP_MSB]) << 11)
++		                | (((int16_t) scratchPad[TEMP_LSB]) << 3)
++		                | neg;
++	}
++
++	/*
++	 DS1820 and DS18S20 have a 9-bit temperature register.
++
++	 Resolutions greater than 9-bit can be calculated using the data from
++	 the temperature, and COUNT REMAIN and COUNT PER °C registers in the
++	 scratchpad.  The resolution of the calculation depends on the model.
++
++	 While the COUNT PER °C register is hard-wired to 16 (10h) in a
++	 DS18S20, it changes with temperature in DS1820.
++
++	 After reading the scratchpad, the TEMP_READ value is obtained by
++	 truncating the 0.5°C bit (bit 0) from the temperature data. The
++	 extended resolution temperature can then be calculated using the
++	 following equation:
++
++	                                  COUNT_PER_C - COUNT_REMAIN
++	 TEMPERATURE = TEMP_READ - 0.25 + --------------------------
++	                                         COUNT_PER_C
++
++	 Hagai Shatz simplified this to integer arithmetic for a 12 bits
++	 value for a DS18S20, and James Cameron added legacy DS1820 support.
++
++	 See - http://myarduinotoy.blogspot.co.uk/2013/02/12bit-result-from-ds18s20.html
++	 */
++
++	if ((deviceAddress[DSROM_FAMILY] == DS18S20MODEL) && (scratchPad[COUNT_PER_C] != 0)) {
++		fpTemperature = ((fpTemperature & 0xfff0) << 3) - 32
++		                + (((scratchPad[COUNT_PER_C] - scratchPad[COUNT_REMAIN]) << 7)
++		                   / scratchPad[COUNT_PER_C]);
++	}
++
++	return fpTemperature;
++}
++
++// returns temperature in 1/128 degrees C or DEVICE_DISCONNECTED_RAW if the
++// device's scratch pad cannot be read successfully.
++// the numeric value of DEVICE_DISCONNECTED_RAW is defined in
++// DallasTemperature.h. It is a large negative number outside the
++// operating range of the device
++int32_t DallasTemperature::getTemp(const uint8_t* deviceAddress) {
++
++	ScratchPad scratchPad;
++	if (isConnected(deviceAddress, scratchPad))
++		return calculateTemperature(deviceAddress, scratchPad);
++	return DEVICE_DISCONNECTED_RAW;
++
++}
++
++// returns temperature in degrees C or DEVICE_DISCONNECTED_C if the
++// device's scratch pad cannot be read successfully.
++// the numeric value of DEVICE_DISCONNECTED_C is defined in
++// DallasTemperature.h. It is a large negative number outside the
++// operating range of the device
++float DallasTemperature::getTempC(const uint8_t* deviceAddress) {
++	return rawToCelsius(getTemp(deviceAddress));
++}
++
++// returns temperature in degrees F or DEVICE_DISCONNECTED_F if the
++// device's scratch pad cannot be read successfully.
++// the numeric value of DEVICE_DISCONNECTED_F is defined in
++// DallasTemperature.h. It is a large negative number outside the
++// operating range of the device
++float DallasTemperature::getTempF(const uint8_t* deviceAddress) {
++	return rawToFahrenheit(getTemp(deviceAddress));
++}
++
++// returns true if the bus requires parasite power
++bool DallasTemperature::isParasitePowerMode(void) {
++	return parasite;
++}
++
++// IF alarm is not used one can store a 16 bit int of userdata in the alarm
++// registers. E.g. an ID of the sensor.
++// See github issue #29
++
++// note if device is not connected it will fail writing the data.
++void DallasTemperature::setUserData(const uint8_t* deviceAddress,
++                                    int16_t data) {
++	// return when stored value == new value
++	if (getUserData(deviceAddress) == data)
++		return;
++
++	ScratchPad scratchPad;
++	if (isConnected(deviceAddress, scratchPad)) {
++		scratchPad[HIGH_ALARM_TEMP] = data >> 8;
++		scratchPad[LOW_ALARM_TEMP] = data & 255;
++		writeScratchPad(deviceAddress, scratchPad);
++	}
++}
++
++int16_t DallasTemperature::getUserData(const uint8_t* deviceAddress) {
++	int16_t data = 0;
++	ScratchPad scratchPad;
++	if (isConnected(deviceAddress, scratchPad)) {
++		data = scratchPad[HIGH_ALARM_TEMP] << 8;
++		data += scratchPad[LOW_ALARM_TEMP];
++	}
++	return data;
++}
++
++// note If address cannot be found no error will be reported.
++int16_t DallasTemperature::getUserDataByIndex(uint8_t deviceIndex) {
++	DeviceAddress deviceAddress;
++	getAddress(deviceAddress, deviceIndex);
++	return getUserData((uint8_t*) deviceAddress);
++}
++
++void DallasTemperature::setUserDataByIndex(uint8_t deviceIndex, int16_t data) {
++	DeviceAddress deviceAddress;
++	getAddress(deviceAddress, deviceIndex);
++	setUserData((uint8_t*) deviceAddress, data);
++}
++
++// Convert float Celsius to Fahrenheit
++float DallasTemperature::toFahrenheit(float celsius) {
++	return (celsius * 1.8f) + 32.0f;
++}
++
++// Convert float Fahrenheit to Celsius
++float DallasTemperature::toCelsius(float fahrenheit) {
++	return (fahrenheit - 32.0f) * 0.555555556f;
++}
++
++// convert from raw to Celsius
++float DallasTemperature::rawToCelsius(int32_t raw) {
++
++	if (raw <= DEVICE_DISCONNECTED_RAW)
++		return DEVICE_DISCONNECTED_C;
++	// C = RAW/128
++	return (float) raw * 0.0078125f;
++
++}
++
++// Convert from Celsius to raw returns temperature in raw integer format.
++// The rounding error in the conversion is smaller than 0.01°C
++// where the resolution of the sensor is at best 0.0625°C (in 12 bit mode).
++// Rounding error can be verified by running:
++//  for (float t=-55.; t<125.; t+=0.01)
++//  {
++//    Serial.println( DallasTemperature::rawToCelsius(DallasTemperature::celsiusToRaw(t))-t, 4 );
++//  }
++int16_t DallasTemperature::celsiusToRaw(float celsius) {
++
++	return static_cast<uint16_t>( celsius * 128.f );
++}
++
++// convert from raw to Fahrenheit
++float DallasTemperature::rawToFahrenheit(int32_t raw) {
++
++	if (raw <= DEVICE_DISCONNECTED_RAW)
++		return DEVICE_DISCONNECTED_F;
++	// C = RAW/128
++	// F = (C*1.8)+32 = (RAW/128*1.8)+32 = (RAW*0.0140625)+32
++	return ((float) raw * 0.0140625f) + 32.0f;
++
++}
++
++// Returns true if all bytes of scratchPad are '\0'
++bool DallasTemperature::isAllZeros(const uint8_t * const scratchPad, const size_t length) {
++	for (size_t i = 0; i < length; i++) {
++		if (scratchPad[i] != 0) {
++			return false;
++		}
++	}
++
++	return true;
++}
++
++#if REQUIRESALARMS
++
++/*
++
++ ALARMS:
++
++ TH and TL Register Format
++
++ BIT 7 BIT 6 BIT 5 BIT 4 BIT 3 BIT 2 BIT 1 BIT 0
++ S    2^6   2^5   2^4   2^3   2^2   2^1   2^0
++
++ Only bits 11 through 4 of the temperature register are used
++ in the TH and TL comparison since TH and TL are 8-bit
++ registers. If the measured temperature is lower than or equal
++ to TL or higher than or equal to TH, an alarm condition exists
++ and an alarm flag is set inside the DS18B20. This flag is
++ updated after every temperature measurement; therefore, if the
++ alarm condition goes away, the flag will be turned off after
++ the next temperature conversion.
++
++ */
++
++// sets the high alarm temperature for a device in degrees Celsius
++// accepts a float, but the alarm resolution will ignore anything
++// after a decimal point.  valid range is -55C - 125C
++void DallasTemperature::setHighAlarmTemp(const uint8_t* deviceAddress,
++                                         int8_t celsius) {
++
++	// return when stored value == new value
++	if (getHighAlarmTemp(deviceAddress) == celsius)
++		return;
++
++	// make sure the alarm temperature is within the device's range
++	if (celsius > 125)
++		celsius = 125;
++	else if (celsius < -55)
++		celsius = -55;
++
++	ScratchPad scratchPad;
++	if (isConnected(deviceAddress, scratchPad)) {
++		scratchPad[HIGH_ALARM_TEMP] = (uint8_t) celsius;
++		writeScratchPad(deviceAddress, scratchPad);
++	}
++
++}
++
++// sets the low alarm temperature for a device in degrees Celsius
++// accepts a float, but the alarm resolution will ignore anything
++// after a decimal point.  valid range is -55C - 125C
++void DallasTemperature::setLowAlarmTemp(const uint8_t* deviceAddress,
++                                        int8_t celsius) {
++
++	// return when stored value == new value
++	if (getLowAlarmTemp(deviceAddress) == celsius)
++		return;
++
++	// make sure the alarm temperature is within the device's range
++	if (celsius > 125)
++		celsius = 125;
++	else if (celsius < -55)
++		celsius = -55;
++
++	ScratchPad scratchPad;
++	if (isConnected(deviceAddress, scratchPad)) {
++		scratchPad[LOW_ALARM_TEMP] = (uint8_t) celsius;
++		writeScratchPad(deviceAddress, scratchPad);
++	}
++
++}
++
++// returns a int8_t with the current high alarm temperature or
++// DEVICE_DISCONNECTED for an address
++int8_t DallasTemperature::getHighAlarmTemp(const uint8_t* deviceAddress) {
++
++	ScratchPad scratchPad;
++	if (isConnected(deviceAddress, scratchPad))
++		return (int8_t) scratchPad[HIGH_ALARM_TEMP];
++	return DEVICE_DISCONNECTED_C;
++
++}
++
++// returns a int8_t with the current low alarm temperature or
++// DEVICE_DISCONNECTED for an address
++int8_t DallasTemperature::getLowAlarmTemp(const uint8_t* deviceAddress) {
++
++	ScratchPad scratchPad;
++	if (isConnected(deviceAddress, scratchPad))
++		return (int8_t) scratchPad[LOW_ALARM_TEMP];
++	return DEVICE_DISCONNECTED_C;
++
++}
++
++// resets internal variables used for the alarm search
++void DallasTemperature::resetAlarmSearch() {
++
++	alarmSearchJunction = -1;
++	alarmSearchExhausted = 0;
++	for (uint8_t i = 0; i < 7; i++) {
++		alarmSearchAddress[i] = 0;
++	}
++
++}
++
++// This is a modified version of the OneWire::search method.
++//
++// Also added the OneWire search fix documented here:
++// http://www.arduino.cc/cgi-bin/yabb2/YaBB.pl?num=1238032295
++//
++// Perform an alarm search. If this function returns a '1' then it has
++// enumerated the next device and you may retrieve the ROM from the
++// OneWire::address variable. If there are no devices, no further
++// devices, or something horrible happens in the middle of the
++// enumeration then a 0 is returned.  If a new device is found then
++// its address is copied to newAddr.  Use
++// DallasTemperature::resetAlarmSearch() to start over.
++bool DallasTemperature::alarmSearch(uint8_t* newAddr) {
++
++	uint8_t i;
++	int8_t lastJunction = -1;
++	uint8_t done = 1;
++
++	if (alarmSearchExhausted)
++		return false;
++	if (!_wire->reset())
++		return false;
++
++	// send the alarm search command
++	_wire->write(0xEC, 0);
++
++	for (i = 0; i < 64; i++) {
++
++		uint8_t a = _wire->read_bit();
++		uint8_t nota = _wire->read_bit();
++		uint8_t ibyte = i / 8;
++		uint8_t ibit = 1 << (i & 7);
++
++		// I don't think this should happen, this means nothing responded, but maybe if
++		// something vanishes during the search it will come up.
++		if (a && nota)
++			return false;
++
++		if (!a && !nota) {
++			if (i == alarmSearchJunction) {
++				// this is our time to decide differently, we went zero last time, go one.
++				a = 1;
++				alarmSearchJunction = lastJunction;
++			} else if (i < alarmSearchJunction) {
++
++				// take whatever we took last time, look in address
++				if (alarmSearchAddress[ibyte] & ibit) {
++					a = 1;
++				} else {
++					// Only 0s count as pending junctions, we've already exhausted the 0 side of 1s
++					a = 0;
++					done = 0;
++					lastJunction = i;
++				}
++			} else {
++				// we are blazing new tree, take the 0
++				a = 0;
++				alarmSearchJunction = i;
++				done = 0;
++			}
++			// OneWire search fix
++			// See: http://www.arduino.cc/cgi-bin/yabb2/YaBB.pl?num=1238032295
++		}
++
++		if (a)
++			alarmSearchAddress[ibyte] |= ibit;
++		else
++			alarmSearchAddress[ibyte] &= ~ibit;
++
++		_wire->write_bit(a);
++	}
++
++	if (done)
++		alarmSearchExhausted = 1;
++	for (i = 0; i < 8; i++)
++		newAddr[i] = alarmSearchAddress[i];
++	return true;
++
++}
++
++// returns true if device address might have an alarm condition
++// (only an alarm search can verify this)
++bool DallasTemperature::hasAlarm(const uint8_t* deviceAddress) {
++
++	ScratchPad scratchPad;
++	if (isConnected(deviceAddress, scratchPad)) {
++
++		int8_t temp = calculateTemperature(deviceAddress, scratchPad) >> 7;
++
++		// check low alarm
++		if (temp <= (int8_t) scratchPad[LOW_ALARM_TEMP])
++			return true;
++
++		// check high alarm
++		if (temp >= (int8_t) scratchPad[HIGH_ALARM_TEMP])
++			return true;
++	}
++
++	// no alarm
++	return false;
++
++}
++
++// returns true if any device is reporting an alarm condition on the bus
++bool DallasTemperature::hasAlarm(void) {
++
++	DeviceAddress deviceAddress;
++	resetAlarmSearch();
++	return alarmSearch(deviceAddress);
++}
++
++// runs the alarm handler for all devices returned by alarmSearch()
++// unless there no _AlarmHandler exist.
++void DallasTemperature::processAlarms(void) {
++
++	if (!hasAlarmHandler()) {
++		return;
++	}
++
++	resetAlarmSearch();
++	DeviceAddress alarmAddr;
++
++	while (alarmSearch(alarmAddr)) {
++		if (validAddress(alarmAddr)) {
++			_AlarmHandler(alarmAddr);
++		}
++	}
++}
++
++// sets the alarm handler
++void DallasTemperature::setAlarmHandler(const AlarmHandler *handler) {
++	_AlarmHandler = handler;
++}
++
++// checks if AlarmHandler has been set.
++bool DallasTemperature::hasAlarmHandler()
++{
++	return _AlarmHandler != NO_ALARM_HANDLER;
++}
++
++#endif
++
++#if REQUIRESNEW
++
++// MnetCS - Allocates memory for DallasTemperature. Allows us to instance a new object
++void* DallasTemperature::operator new(unsigned int size) { // Implicit NSS obj size
++
++	void * p;// void pointer
++	p = malloc(size);// Allocate memory
++	memset((DallasTemperature*)p, 0, size); // Initialise memory
++
++	//!!! CANT EXPLICITLY CALL CONSTRUCTOR - workaround by using an init() methodR - workaround by using an init() method
++	return (DallasTemperature*) p;// Cast blank region to NSS pointer
++}
++
++// MnetCS 2009 -  Free the memory used by this instance
++void DallasTemperature::operator delete(void* p) {
++
++	DallasTemperature* pNss = (DallasTemperature*) p; // Cast to NSS pointer
++	pNss->~DallasTemperature();// Destruct the object
++
++	free(p);// Free the memory
++}
++
++#endif
+diff --git a/libraries/DallasTemperature/DallasTemperature.h b/libraries/DallasTemperature/DallasTemperature.h
+new file mode 100644
+index 00000000..789880d6
+--- /dev/null
++++ b/libraries/DallasTemperature/DallasTemperature.h
+@@ -0,0 +1,346 @@
++#ifndef DallasTemperature_h
++#define DallasTemperature_h
++
++#define DALLASTEMPLIBVERSION "3.8.1" // To be deprecated -> TODO remove in 4.0.0
++
++// This library is free software; you can redistribute it and/or
++// modify it under the terms of the GNU Lesser General Public
++// License as published by the Free Software Foundation; either
++// version 2.1 of the License, or (at your option) any later version.
++
++// set to true to include code for new and delete operators
++#ifndef REQUIRESNEW
++#define REQUIRESNEW false
++#endif
++
++// set to true to include code implementing alarm search functions
++#ifndef REQUIRESALARMS
++#define REQUIRESALARMS true
++#endif
++
++#include <inttypes.h>
++#ifdef __STM32F1__
++#include <OneWireSTM.h>
++#else
++#include <OneWire.h>
++#endif
++
++// Model IDs
++#define DS18S20MODEL 0x10  // also DS1820
++#define DS18B20MODEL 0x28  // also MAX31820
++#define DS1822MODEL  0x22
++#define DS1825MODEL  0x3B  // also MAX31850
++#define DS28EA00MODEL 0x42
++
++// Error Codes
++// See https://github.com/milesburton/Arduino-Temperature-Control-Library/commit/ac1eb7f56e3894e855edc3353be4bde4aa838d41#commitcomment-75490966 for the 16bit implementation. Reverted due to microcontroller resource constraints.
++#define DEVICE_DISCONNECTED_C -127
++#define DEVICE_DISCONNECTED_F -196.6
++#define DEVICE_DISCONNECTED_RAW -7040
++
++#define DEVICE_FAULT_OPEN_C -254
++#define DEVICE_FAULT_OPEN_F -425.199982
++#define DEVICE_FAULT_OPEN_RAW -32512
++
++#define DEVICE_FAULT_SHORTGND_C -253
++#define DEVICE_FAULT_SHORTGND_F -423.399994
++#define DEVICE_FAULT_SHORTGND_RAW -32384
++
++#define DEVICE_FAULT_SHORTVDD_C -252
++#define DEVICE_FAULT_SHORTVDD_F -421.599976
++#define DEVICE_FAULT_SHORTVDD_RAW -32256
++
++// For readPowerSupply on oneWire bus
++// definition of nullptr for C++ < 11, using official workaround:
++// http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2007/n2431.pdf
++#if __cplusplus < 201103L
++const class
++{
++public:
++	template <class T>
++	operator T *() const {
++		return 0;
++	}
++
++	template <class C, class T>
++	operator T C::*() const {
++		return 0;
++	}
++
++private:
++	void operator&() const;
++} nullptr = {};
++#endif
++
++typedef uint8_t DeviceAddress[8];
++
++class DallasTemperature {
++public:
++
++	DallasTemperature();
++	DallasTemperature(OneWire*);
++	DallasTemperature(OneWire*, uint8_t);
++
++	void setOneWire(OneWire*);
++
++	void setPullupPin(uint8_t);
++
++	// initialise bus
++	void begin(void);
++
++	// returns the number of devices found on the bus
++	uint8_t getDeviceCount(void);
++
++	// returns the number of DS18xxx Family devices on bus
++	uint8_t getDS18Count(void);
++
++	// returns true if address is valid
++	bool validAddress(const uint8_t*);
++
++	// returns true if address is of the family of sensors the lib supports.
++	bool validFamily(const uint8_t* deviceAddress);
++
++	// finds an address at a given index on the bus
++	bool getAddress(uint8_t*, uint8_t);
++
++	// attempt to determine if the device at the given address is connected to the bus
++	bool isConnected(const uint8_t*);
++
++	// attempt to determine if the device at the given address is connected to the bus
++	// also allows for updating the read scratchpad
++	bool isConnected(const uint8_t*, uint8_t*);
++
++	// read device's scratchpad
++	bool readScratchPad(const uint8_t*, uint8_t*);
++
++	// write device's scratchpad
++	void writeScratchPad(const uint8_t*, const uint8_t*);
++
++	// read device's power requirements
++	bool readPowerSupply(const uint8_t* deviceAddress = nullptr);
++
++	// get global resolution
++	uint8_t getResolution();
++
++	// set global resolution to 9, 10, 11, or 12 bits
++	void setResolution(uint8_t);
++
++	// returns the device resolution: 9, 10, 11, or 12 bits
++	uint8_t getResolution(const uint8_t*);
++
++	// set resolution of a device to 9, 10, 11, or 12 bits
++	bool setResolution(const uint8_t*, uint8_t,
++	                   bool skipGlobalBitResolutionCalculation = false);
++
++	// sets/gets the waitForConversion flag
++	void setWaitForConversion(bool);
++	bool getWaitForConversion(void);
++
++	// sets/gets the checkForConversion flag
++	void setCheckForConversion(bool);
++	bool getCheckForConversion(void);
++
++	struct request_t {
++		bool result;
++		unsigned long timestamp;
++
++		operator bool() {
++			return result;
++		}
++	};
++
++	// sends command for all devices on the bus to perform a temperature conversion
++	request_t requestTemperatures(void);
++
++	// sends command for one device to perform a temperature conversion by address
++	request_t requestTemperaturesByAddress(const uint8_t*);
++
++	// sends command for one device to perform a temperature conversion by index
++	request_t requestTemperaturesByIndex(uint8_t);
++
++	// returns temperature raw value (12 bit integer of 1/128 degrees C)
++	int32_t getTemp(const uint8_t*);
++
++	// returns temperature in degrees C
++	float getTempC(const uint8_t*);
++
++	// returns temperature in degrees F
++	float getTempF(const uint8_t*);
++
++	// Get temperature for device index (slow)
++	float getTempCByIndex(uint8_t);
++
++	// Get temperature for device index (slow)
++	float getTempFByIndex(uint8_t);
++
++	// returns true if the bus requires parasite power
++	bool isParasitePowerMode(void);
++
++	// Is a conversion complete on the wire? Only applies to the first sensor on the wire.
++	bool isConversionComplete(void);
++
++	static uint16_t millisToWaitForConversion(uint8_t);
++
++	uint16_t millisToWaitForConversion();
++
++	// Sends command to one device to save values from scratchpad to EEPROM by index
++	// Returns true if no errors were encountered, false indicates failure
++	bool saveScratchPadByIndex(uint8_t);
++
++	// Sends command to one or more devices to save values from scratchpad to EEPROM
++	// Returns true if no errors were encountered, false indicates failure
++	bool saveScratchPad(const uint8_t* = nullptr);
++
++	// Sends command to one device to recall values from EEPROM to scratchpad by index
++	// Returns true if no errors were encountered, false indicates failure
++	bool recallScratchPadByIndex(uint8_t);
++
++	// Sends command to one or more devices to recall values from EEPROM to scratchpad
++	// Returns true if no errors were encountered, false indicates failure
++	bool recallScratchPad(const uint8_t* = nullptr);
++
++	// Sets the autoSaveScratchPad flag
++	void setAutoSaveScratchPad(bool);
++
++	// Gets the autoSaveScratchPad flag
++	bool getAutoSaveScratchPad(void);
++
++#if REQUIRESALARMS
++
++	typedef void AlarmHandler(const uint8_t*);
++
++	// sets the high alarm temperature for a device
++	// accepts a int8_t.  valid range is -55C - 125C
++	void setHighAlarmTemp(const uint8_t*, int8_t);
++
++	// sets the low alarm temperature for a device
++	// accepts a int8_t.  valid range is -55C - 125C
++	void setLowAlarmTemp(const uint8_t*, int8_t);
++
++	// returns a int8_t with the current high alarm temperature for a device
++	// in the range -55C - 125C
++	int8_t getHighAlarmTemp(const uint8_t*);
++
++	// returns a int8_t with the current low alarm temperature for a device
++	// in the range -55C - 125C
++	int8_t getLowAlarmTemp(const uint8_t*);
++
++	// resets internal variables used for the alarm search
++	void resetAlarmSearch(void);
++
++	// search the wire for devices with active alarms
++	bool alarmSearch(uint8_t*);
++
++	// returns true if ia specific device has an alarm
++	bool hasAlarm(const uint8_t*);
++
++	// returns true if any device is reporting an alarm on the bus
++	bool hasAlarm(void);
++
++	// runs the alarm handler for all devices returned by alarmSearch()
++	void processAlarms(void);
++
++	// sets the alarm handler
++	void setAlarmHandler(const AlarmHandler *);
++
++	// returns true if an AlarmHandler has been set
++	bool hasAlarmHandler();
++
++#endif
++
++	// if no alarm handler is used the two bytes can be used as user data
++	// example of such usage is an ID.
++	// note if device is not connected it will fail writing the data.
++	// note if address cannot be found no error will be reported.
++	// in short use carefully
++	void setUserData(const uint8_t*, int16_t);
++	void setUserDataByIndex(uint8_t, int16_t);
++	int16_t getUserData(const uint8_t*);
++	int16_t getUserDataByIndex(uint8_t);
++
++	// convert from Celsius to Fahrenheit
++	static float toFahrenheit(float);
++
++	// convert from Fahrenheit to Celsius
++	static float toCelsius(float);
++
++	// convert from raw to Celsius
++	static float rawToCelsius(int32_t);
++
++	// convert from Celsius to raw
++	static int16_t celsiusToRaw(float);
++
++	// convert from raw to Fahrenheit
++	static float rawToFahrenheit(int32_t);
++
++#if REQUIRESNEW
++
++	// initialize memory area
++	void* operator new(unsigned int);
++
++	// delete memory reference
++	void operator delete(void*);
++
++#endif
++
++	void blockTillConversionComplete(uint8_t);
++	void blockTillConversionComplete(uint8_t, unsigned long);
++	void blockTillConversionComplete(uint8_t, request_t);
++
++private:
++	typedef uint8_t ScratchPad[9];
++
++	// parasite power on or off
++	bool parasite;
++
++	// external pullup
++	bool useExternalPullup;
++	uint8_t pullupPin;
++
++	// used to determine the delay amount needed to allow for the
++	// temperature conversion to take place
++	uint8_t bitResolution;
++
++	// used to requestTemperature with or without delay
++	bool waitForConversion;
++
++	// used to requestTemperature to dynamically check if a conversion is complete
++	bool checkForConversion;
++
++	// used to determine if values will be saved from scratchpad to EEPROM on every scratchpad write
++	bool autoSaveScratchPad;
++
++	// count of devices on the bus
++	uint8_t devices;
++
++	// count of DS18xxx Family devices on bus
++	uint8_t ds18Count;
++
++	// Take a pointer to one wire instance
++	OneWire* _wire;
++
++	// reads scratchpad and returns the raw temperature
++	int32_t calculateTemperature(const uint8_t*, uint8_t*);
++
++
++	// Returns true if all bytes of scratchPad are '\0'
++	bool isAllZeros(const uint8_t* const scratchPad, const size_t length = 9);
++
++	// External pullup control
++	void activateExternalPullup(void);
++	void deactivateExternalPullup(void);
++
++#if REQUIRESALARMS
++
++	// required for alarmSearch
++	uint8_t alarmSearchAddress[8];
++	int8_t alarmSearchJunction;
++	uint8_t alarmSearchExhausted;
++
++	// the alarm handler function pointer
++	AlarmHandler *_AlarmHandler;
++
++#endif
++
++};
++#endif
+diff --git a/libraries/DallasTemperature/README.md b/libraries/DallasTemperature/README.md
+new file mode 100644
+index 00000000..e8f4920b
+--- /dev/null
++++ b/libraries/DallasTemperature/README.md
+@@ -0,0 +1,80 @@
++[![Arduino CI](https://github.com/milesburton/Arduino-Temperature-Control-Library/workflows/Arduino%20CI/badge.svg)](https://github.com/marketplace/actions/arduino_ci)
++[![Arduino-lint](https://github.com/milesburton/Arduino-Temperature-Control-Library/actions/workflows/arduino-lint.yml/badge.svg)](https://github.com/RobTillaart/AS5600/actions/workflows/arduino-lint.yml)
++[![JSON check](https://github.com/milesburton/Arduino-Temperature-Control-Library/actions/workflows/jsoncheck.yml/badge.svg)](https://github.com/RobTillaart/AS5600/actions/workflows/jsoncheck.yml)
++[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/milesburton/Arduino-Temperature-Control-Library/blob/master/LICENSE)
++[![GitHub release](https://img.shields.io/github/release/milesburton/Arduino-Temperature-Control-Library.svg?maxAge=3600)](https://github.com/milesburton/Arduino-Temperature-Control-Library/releases)
++
++
++# Arduino Library for Maxim Temperature Integrated Circuits
++
++## Usage
++
++This library supports the following devices :
++
++
++* DS18B20
++* DS18S20 - Please note there appears to be an issue with this series.
++* DS1822
++* DS1820
++* MAX31820
++* MAX31850
++
++
++You will need a pull-up resistor of about 5 KOhm between the 1-Wire data line
++and your 5V power. If you are using the DS18B20, ground pins 1 and 3. The
++centre pin is the data line '1-wire'.
++
++In case of temperature conversion problems (result is `-85`), strong pull-up setup may be necessary. See section 
++_Powering the DS18B20_ in 
++[DS18B20 datasheet](https://datasheets.maximintegrated.com/en/ds/DS18B20.pdf) (page 7)
++and use `DallasTemperature(OneWire*, uint8_t)` constructor.
++
++We have included a "REQUIRESNEW" and "REQUIRESALARMS" definition. If you 
++want to slim down the code feel free to use either of these by including
++
++
++
++	#define REQUIRESNEW 
++
++or 
++
++	#define REQUIRESALARMS
++
++
++at the top of DallasTemperature.h
++
++Finally, please include OneWire from Paul Stoffregen in the library manager before you begin.
++
++## Credits
++
++The OneWire code has been derived from
++http://www.arduino.cc/playground/Learning/OneWire.
++Miles Burton <miles@mnetcs.com> originally developed this library.
++Tim Newsome <nuisance@casualhacker.net> added support for multiple sensors on
++the same bus.
++Guil Barros [gfbarros@bappos.com] added getTempByAddress (v3.5)
++   Note: these are implemented as getTempC(address) and getTempF(address)
++Rob Tillaart [rob.tillaart@gmail.com] added async modus (v3.7.0)
++
++
++## Website
++
++
++Additional documentation may be found here
++https://www.milesburton.com/Dallas_Temperature_Control_Library
++
++# License
++
++This library is free software; you can redistribute it and/or
++modify it under the terms of the GNU Lesser General Public
++License as published by the Free Software Foundation; either
++version 2.1 of the License, or (at your option) any later version.
++
++This library is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++Lesser General Public License for more details.
++
++You should have received a copy of the GNU Lesser General Public
++License along with this library; if not, write to the Free Software
++Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+diff --git a/libraries/DallasTemperature/examples/Alarm/Alarm.ino b/libraries/DallasTemperature/examples/Alarm/Alarm.ino
+new file mode 100644
+index 00000000..d94a0b80
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/Alarm/Alarm.ino
+@@ -0,0 +1,161 @@
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++// arrays to hold device addresses
++DeviceAddress insideThermometer, outsideThermometer;
++
++void setup(void)
++{
++  // start serial port
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature IC Control Library Demo");
++
++  // Start up the library
++  sensors.begin();
++
++  // locate devices on the bus
++  Serial.print("Found ");
++  Serial.print(sensors.getDeviceCount(), DEC);
++  Serial.println(" devices.");
++
++  // search for devices on the bus and assign based on an index.
++  if (!sensors.getAddress(insideThermometer, 0)) Serial.println("Unable to find address for Device 0");
++  if (!sensors.getAddress(outsideThermometer, 1)) Serial.println("Unable to find address for Device 1");
++
++  // show the addresses we found on the bus
++  Serial.print("Device 0 Address: ");
++  printAddress(insideThermometer);
++  Serial.println();
++
++  Serial.print("Device 0 Alarms: ");
++  printAlarms(insideThermometer);
++  Serial.println();
++
++  Serial.print("Device 1 Address: ");
++  printAddress(outsideThermometer);
++  Serial.println();
++
++  Serial.print("Device 1 Alarms: ");
++  printAlarms(outsideThermometer);
++  Serial.println();
++
++  Serial.println("Setting alarm temps...");
++
++  // alarm when temp is higher than 30C
++  sensors.setHighAlarmTemp(insideThermometer, 30);
++
++  // alarm when temp is lower than -10C
++  sensors.setLowAlarmTemp(insideThermometer, -10);
++
++  // alarm when temp is higher than 31C
++  sensors.setHighAlarmTemp(outsideThermometer, 31);
++
++  // alarn when temp is lower than 27C
++  sensors.setLowAlarmTemp(outsideThermometer, 27);
++
++  Serial.print("New Device 0 Alarms: ");
++  printAlarms(insideThermometer);
++  Serial.println();
++
++  Serial.print("New Device 1 Alarms: ");
++  printAlarms(outsideThermometer);
++  Serial.println();
++}
++
++// function to print a device address
++void printAddress(DeviceAddress deviceAddress)
++{
++  for (uint8_t i = 0; i < 8; i++)
++  {
++    if (deviceAddress[i] < 16) Serial.print("0");
++    Serial.print(deviceAddress[i], HEX);
++  }
++}
++
++// function to print the temperature for a device
++void printTemperature(DeviceAddress deviceAddress)
++{
++  float tempC = sensors.getTempC(deviceAddress);
++  Serial.print("Temp C: ");
++  Serial.print(tempC);
++  Serial.print(" Temp F: ");
++  Serial.print(DallasTemperature::toFahrenheit(tempC));
++}
++
++void printAlarms(uint8_t deviceAddress[])
++{
++  char temp;
++  temp = sensors.getHighAlarmTemp(deviceAddress);
++  Serial.print("High Alarm: ");
++  Serial.print(temp, DEC);
++  Serial.print("C/");
++  Serial.print(DallasTemperature::toFahrenheit(temp));
++  Serial.print("F | Low Alarm: ");
++  temp = sensors.getLowAlarmTemp(deviceAddress);
++  Serial.print(temp, DEC);
++  Serial.print("C/");
++  Serial.print(DallasTemperature::toFahrenheit(temp));
++  Serial.print("F");
++}
++
++// main function to print information about a device
++void printData(DeviceAddress deviceAddress)
++{
++  Serial.print("Device Address: ");
++  printAddress(deviceAddress);
++  Serial.print(" ");
++  printTemperature(deviceAddress);
++  Serial.println();
++}
++
++void checkAlarm(DeviceAddress deviceAddress)
++{
++  if (sensors.hasAlarm(deviceAddress))
++  {
++    Serial.print("ALARM: ");
++    printData(deviceAddress);
++  }
++}
++
++void loop(void)
++{
++  // call sensors.requestTemperatures() to issue a global temperature
++  // request to all devices on the bus
++  Serial.print("Requesting temperatures...");
++  sensors.requestTemperatures();
++  Serial.println("DONE");
++
++  // Method 1:
++  // check each address individually for an alarm condition
++  checkAlarm(insideThermometer);
++  checkAlarm(outsideThermometer);
++/*
++  // Alternate method:
++  // Search the bus and iterate through addresses of devices with alarms
++
++  // space for the alarm device's address
++  DeviceAddress alarmAddr;
++
++  Serial.println("Searching for alarms...");
++
++  // resetAlarmSearch() must be called before calling alarmSearch()
++  sensors.resetAlarmSearch();
++
++  // alarmSearch() returns 0 when there are no devices with alarms
++  while (sensors.alarmSearch(alarmAddr))
++  {
++    Serial.print("ALARM: ");
++    printData(alarmAddr);
++  }
++*/
++
++}
+diff --git a/libraries/DallasTemperature/examples/AlarmHandler/AlarmHandler.ino b/libraries/DallasTemperature/examples/AlarmHandler/AlarmHandler.ino
+new file mode 100644
+index 00000000..11a1bd9e
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/AlarmHandler/AlarmHandler.ino
+@@ -0,0 +1,143 @@
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++// arrays to hold device addresses
++DeviceAddress insideThermometer, outsideThermometer;
++
++// function that will be called when an alarm condition exists during DallasTemperatures::processAlarms();
++void newAlarmHandler(const uint8_t* deviceAddress)
++{
++  Serial.println("Alarm Handler Start");
++  printAlarmInfo(deviceAddress);
++  printTemp(deviceAddress);
++  Serial.println();
++  Serial.println("Alarm Handler Finish");
++}
++
++void printCurrentTemp(DeviceAddress deviceAddress)
++{
++  printAddress(deviceAddress);
++  printTemp(deviceAddress);
++  Serial.println();
++}
++
++void printAddress(const DeviceAddress deviceAddress)
++{
++  Serial.print("Address: ");
++  for (uint8_t i = 0; i < 8; i++)
++  {
++    if (deviceAddress[i] < 16) Serial.print("0");
++    Serial.print(deviceAddress[i], HEX);
++  }
++  Serial.print(" ");
++}
++
++void printTemp(const DeviceAddress deviceAddress)
++{
++  float tempC = sensors.getTempC(deviceAddress);
++  if (tempC != DEVICE_DISCONNECTED_C)
++  {
++    Serial.print("Current Temp C: ");
++    Serial.print(tempC);
++  }
++  else Serial.print("DEVICE DISCONNECTED");
++  Serial.print(" ");
++}
++
++void printAlarmInfo(const DeviceAddress deviceAddress)
++{
++  char temp;
++  printAddress(deviceAddress);
++  temp = sensors.getHighAlarmTemp(deviceAddress);
++  Serial.print("High Alarm: ");
++  Serial.print(temp, DEC);
++  Serial.print("C");
++  Serial.print(" Low Alarm: ");
++  temp = sensors.getLowAlarmTemp(deviceAddress);
++  Serial.print(temp, DEC);
++  Serial.print("C");
++  Serial.print(" ");
++}
++
++void setup(void)
++{
++  // start serial port
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature IC Control Library Demo");
++
++  // Start up the library
++  sensors.begin();
++
++  // locate devices on the bus
++  Serial.print("Found ");
++  Serial.print(sensors.getDeviceCount(), DEC);
++  Serial.println(" devices.");
++
++  // search for devices on the bus and assign based on an index
++  if (!sensors.getAddress(insideThermometer, 0)) Serial.println("Unable to find address for Device 0");
++  if (!sensors.getAddress(outsideThermometer, 1)) Serial.println("Unable to find address for Device 1");
++
++  Serial.print("Device insideThermometer ");
++  printAlarmInfo(insideThermometer);
++  Serial.println();
++
++  Serial.print("Device outsideThermometer ");
++  printAlarmInfo(outsideThermometer);
++  Serial.println();
++
++  // set alarm ranges
++  Serial.println("Setting alarm temps...");
++  sensors.setHighAlarmTemp(insideThermometer, 26);
++  sensors.setLowAlarmTemp(insideThermometer, 22);
++  sensors.setHighAlarmTemp(outsideThermometer, 25);
++  sensors.setLowAlarmTemp(outsideThermometer, 21);
++
++  Serial.print("New insideThermometer ");
++  printAlarmInfo(insideThermometer);
++  Serial.println();
++
++  Serial.print("New outsideThermometer ");
++  printAlarmInfo(outsideThermometer);
++  Serial.println();
++
++  // attach alarm handler
++  sensors.setAlarmHandler(&newAlarmHandler);
++
++}
++
++void loop(void)
++{
++  // ask the devices to measure the temperature
++  sensors.requestTemperatures();
++
++  // if an alarm condition exists as a result of the most recent
++  // requestTemperatures() request, it exists until the next time
++  // requestTemperatures() is called AND there isn't an alarm condition
++  // on the device
++  if (sensors.hasAlarm())
++  {
++    Serial.println("Oh noes!  There is at least one alarm on the bus.");
++  }
++
++  // call alarm handler function defined by sensors.setAlarmHandler
++  // for each device reporting an alarm
++  sensors.processAlarms();
++
++  if (!sensors.hasAlarm())
++  {
++    // just print out the current temperature
++    printCurrentTemp(insideThermometer);
++    printCurrentTemp(outsideThermometer);
++  }
++
++  delay(1000);
++}
+diff --git a/libraries/DallasTemperature/examples/ExternalPullup/ExternalPullup.ino b/libraries/DallasTemperature/examples/ExternalPullup/ExternalPullup.ino
+new file mode 100644
+index 00000000..5063a3ad
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/ExternalPullup/ExternalPullup.ino
+@@ -0,0 +1,35 @@
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino, while external pullup P-MOSFET gate into port 3
++#define ONE_WIRE_BUS    2
++#define ONE_WIRE_PULLUP 3
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire, ONE_WIRE_PULLUP);
++
++void setup(void)
++{
++  // start serial port
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature IC Control Library Demo");
++
++  // Start up the library
++  sensors.begin();
++}
++
++void loop(void)
++{
++  // call sensors.requestTemperatures() to issue a global temperature
++  // request to all devices on the bus
++  Serial.print("Requesting temperatures...");
++  sensors.requestTemperatures(); // Send the command to get temperatures
++  Serial.println("DONE");
++
++  for (int i = 0; i < sensors.getDeviceCount(); i++) {
++    Serial.println("Temperature for Device " + String(i) + " is: " + String(sensors.getTempCByIndex(i)));
++  }
++}
+diff --git a/libraries/DallasTemperature/examples/Multibus_simple/Multibus_simple.ino b/libraries/DallasTemperature/examples/Multibus_simple/Multibus_simple.ino
+new file mode 100644
+index 00000000..fc7497e4
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/Multibus_simple/Multibus_simple.ino
+@@ -0,0 +1,43 @@
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++OneWire ds18x20[] = { 3, 7 };
++const int oneWireCount = sizeof(ds18x20) / sizeof(OneWire);
++DallasTemperature sensor[oneWireCount];
++
++void setup(void) {
++  // start serial port
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature Multiple Bus Control Library Simple Demo");
++  Serial.print("============Ready with ");
++  Serial.print(oneWireCount);
++  Serial.println(" Sensors================");
++
++  // Start up the library on all defined bus-wires
++  DeviceAddress deviceAddress;
++  for (int i = 0; i < oneWireCount; i++) {
++    sensor[i].setOneWire(&ds18x20[i]);
++    sensor[i].begin();
++    if (sensor[i].getAddress(deviceAddress, 0)) sensor[i].setResolution(deviceAddress, 12);
++  }
++}
++
++void loop(void) {
++  // call sensors.requestTemperatures() to issue a global temperature
++  // request to all devices on the bus
++  Serial.print("Requesting temperatures...");
++  for (int i = 0; i < oneWireCount; i++) {
++    sensor[i].requestTemperatures();
++  }
++  Serial.println("DONE");
++
++  delay(1000);
++  for (int i = 0; i < oneWireCount; i++) {
++    float temperature = sensor[i].getTempCByIndex(0);
++    Serial.print("Temperature for the sensor ");
++    Serial.print(i);
++    Serial.print(" is ");
++    Serial.println(temperature);
++  }
++  Serial.println();
++}
+diff --git a/libraries/DallasTemperature/examples/Multiple/Multiple.ino b/libraries/DallasTemperature/examples/Multiple/Multiple.ino
+new file mode 100644
+index 00000000..0a20cc21
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/Multiple/Multiple.ino
+@@ -0,0 +1,148 @@
++// Include the libraries we need
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++#define TEMPERATURE_PRECISION 9
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++// arrays to hold device addresses
++DeviceAddress insideThermometer, outsideThermometer;
++
++// Assign address manually. The addresses below will need to be changed
++// to valid device addresses on your bus. Device address can be retrieved
++// by using either oneWire.search(deviceAddress) or individually via
++// sensors.getAddress(deviceAddress, index)
++// DeviceAddress insideThermometer = { 0x28, 0x1D, 0x39, 0x31, 0x2, 0x0, 0x0, 0xF0 };
++// DeviceAddress outsideThermometer   = { 0x28, 0x3F, 0x1C, 0x31, 0x2, 0x0, 0x0, 0x2 };
++
++void setup(void)
++{
++  // start serial port
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature IC Control Library Demo");
++
++  // Start up the library
++  sensors.begin();
++
++  // locate devices on the bus
++  Serial.print("Locating devices...");
++  Serial.print("Found ");
++  Serial.print(sensors.getDeviceCount(), DEC);
++  Serial.println(" devices.");
++
++  // report parasite power requirements
++  Serial.print("Parasite power is: ");
++  if (sensors.isParasitePowerMode()) Serial.println("ON");
++  else Serial.println("OFF");
++
++  // Search for devices on the bus and assign based on an index. Ideally,
++  // you would do this to initially discover addresses on the bus and then
++  // use those addresses and manually assign them (see above) once you know
++  // the devices on your bus (and assuming they don't change).
++  //
++  // method 1: by index
++  if (!sensors.getAddress(insideThermometer, 0)) Serial.println("Unable to find address for Device 0");
++  if (!sensors.getAddress(outsideThermometer, 1)) Serial.println("Unable to find address for Device 1");
++
++  // method 2: search()
++  // search() looks for the next device. Returns 1 if a new address has been
++  // returned. A zero might mean that the bus is shorted, there are no devices,
++  // or you have already retrieved all of them. It might be a good idea to
++  // check the CRC to make sure you didn't get garbage. The order is
++  // deterministic. You will always get the same devices in the same order
++  //
++  // Must be called before search()
++  //oneWire.reset_search();
++  // assigns the first address found to insideThermometer
++  //if (!oneWire.search(insideThermometer)) Serial.println("Unable to find address for insideThermometer");
++  // assigns the seconds address found to outsideThermometer
++  //if (!oneWire.search(outsideThermometer)) Serial.println("Unable to find address for outsideThermometer");
++
++  // show the addresses we found on the bus
++  Serial.print("Device 0 Address: ");
++  printAddress(insideThermometer);
++  Serial.println();
++
++  Serial.print("Device 1 Address: ");
++  printAddress(outsideThermometer);
++  Serial.println();
++
++  // set the resolution to 9 bit per device
++  sensors.setResolution(insideThermometer, TEMPERATURE_PRECISION);
++  sensors.setResolution(outsideThermometer, TEMPERATURE_PRECISION);
++
++  Serial.print("Device 0 Resolution: ");
++  Serial.print(sensors.getResolution(insideThermometer), DEC);
++  Serial.println();
++
++  Serial.print("Device 1 Resolution: ");
++  Serial.print(sensors.getResolution(outsideThermometer), DEC);
++  Serial.println();
++}
++
++// function to print a device address
++void printAddress(DeviceAddress deviceAddress)
++{
++  for (uint8_t i = 0; i < 8; i++)
++  {
++    // zero pad the address if necessary
++    if (deviceAddress[i] < 16) Serial.print("0");
++    Serial.print(deviceAddress[i], HEX);
++  }
++}
++
++// function to print the temperature for a device
++void printTemperature(DeviceAddress deviceAddress)
++{
++  float tempC = sensors.getTempC(deviceAddress);
++  if (tempC == DEVICE_DISCONNECTED_C)
++  {
++    Serial.println("Error: Could not read temperature data");
++    return;
++  }
++  Serial.print("Temp C: ");
++  Serial.print(tempC);
++  Serial.print(" Temp F: ");
++  Serial.print(DallasTemperature::toFahrenheit(tempC));
++}
++
++// function to print a device's resolution
++void printResolution(DeviceAddress deviceAddress)
++{
++  Serial.print("Resolution: ");
++  Serial.print(sensors.getResolution(deviceAddress));
++  Serial.println();
++}
++
++// main function to print information about a device
++void printData(DeviceAddress deviceAddress)
++{
++  Serial.print("Device Address: ");
++  printAddress(deviceAddress);
++  Serial.print(" ");
++  printTemperature(deviceAddress);
++  Serial.println();
++}
++
++/*
++   Main function, calls the temperatures in a loop.
++*/
++void loop(void)
++{
++  // call sensors.requestTemperatures() to issue a global temperature
++  // request to all devices on the bus
++  Serial.print("Requesting temperatures...");
++  sensors.requestTemperatures();
++  Serial.println("DONE");
++
++  // print the device information
++  printData(insideThermometer);
++  printData(outsideThermometer);
++}
+diff --git a/libraries/DallasTemperature/examples/SaveRecallScratchPad/SaveRecallScratchPad.ino b/libraries/DallasTemperature/examples/SaveRecallScratchPad/SaveRecallScratchPad.ino
+new file mode 100644
+index 00000000..7a7bb2f8
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/SaveRecallScratchPad/SaveRecallScratchPad.ino
+@@ -0,0 +1,106 @@
++//
++//    FILE: SaveRecallScratchPad.ino
++//  AUTHOR: GitKomodo
++// VERSION: 0.0.1
++// PURPOSE: Show DallasTemperature lib functionality to
++//          save/recall ScratchPad values to/from EEPROM
++//
++// HISTORY:
++// 0.0.1 = 2020-02-18 initial version
++//
++
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++#define ONE_WIRE_BUS 2
++
++OneWire oneWire(ONE_WIRE_BUS);
++DallasTemperature sensors(&oneWire);
++DeviceAddress deviceAddress;
++
++void setup()
++{
++  Serial.begin(9600);
++  Serial.println(__FILE__);
++  Serial.println("Dallas Temperature Demo");
++
++  sensors.begin();
++
++  // Get ID of first sensor (at index 0)
++  sensors.getAddress(deviceAddress, 0);
++
++  // By default configuration and alarm/userdata registers are also saved to EEPROM
++  // when they're changed. Sensors recall these values automatically when powered up.
++
++  // Turn OFF automatic saving of configuration and alarm/userdata registers to EEPROM
++  sensors.setAutoSaveScratchPad(false);
++
++  // Change configuration and alarm/userdata registers on the scratchpad
++  int8_t resolution = 12;
++  sensors.setResolution(deviceAddress, resolution);
++  int16_t userdata = 24680;
++  sensors.setUserData(deviceAddress, userdata);
++
++  // Save configuration and alarm/userdata registers to EEPROM
++  sensors.saveScratchPad(deviceAddress);
++
++  // saveScratchPad can also be used without a parameter to save the configuration
++  // and alarm/userdata registers of ALL connected sensors to EEPROM:
++  //
++  //   sensors.saveScratchPad();
++  //
++  // Or the configuration and alarm/userdata registers of a sensor can be saved to
++  // EEPROM by index:
++  //
++  //   sensors.saveScratchPadByIndex(0);
++
++  // Print current values on the scratchpad (resolution = 12, userdata = 24680)
++  printValues();
++
++}
++
++void loop() {
++
++  // Change configuration and alarm/userdata registers on the scratchpad
++  int8_t resolution = 10;
++  sensors.setResolution(deviceAddress, resolution);
++  int16_t userdata = 12345;
++  sensors.setUserData(deviceAddress, userdata);
++
++  // Print current values on the scratchpad (resolution = 10, userdata = 12345)
++  printValues();
++
++  delay(2000);
++
++  // Recall configuration and alarm/userdata registers from EEPROM
++  sensors.recallScratchPad(deviceAddress);
++
++  // recallScratchPad can also be used without a parameter to recall the configuration
++  // and alarm/userdata registers of ALL connected sensors from EEPROM:
++  //
++  //   sensors.recallScratchPad();
++  //
++  // Or the configuration and alarm/userdata registers of a sensor can be recalled
++  // from EEPROM by index:
++  //
++  //   sensors.recallScratchPadByIndex(0);
++
++  // Print current values on the scratchpad (resolution = 12, userdata = 24680)
++  printValues();
++
++  delay(2000);
++
++}
++
++void printValues() {
++
++  Serial.println();
++  Serial.println("Current values on the scratchpad:");
++
++  Serial.print("Resolution:\t");
++  Serial.println(sensors.getResolution(deviceAddress));
++
++  Serial.print("User data:\t");
++  Serial.println(sensors.getUserData(deviceAddress));
++
++}
+diff --git a/libraries/DallasTemperature/examples/SetUserData/SetUserData.ino b/libraries/DallasTemperature/examples/SetUserData/SetUserData.ino
+new file mode 100644
+index 00000000..52d3f7fc
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/SetUserData/SetUserData.ino
+@@ -0,0 +1,47 @@
++//
++// This sketch does not use the ALARM registers and uses those 2 bytes as a counter
++// these 2 bytes can be used for other purposes as well e.g. last temperature or
++// a specific ID.
++//
++
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++int count = 0;
++
++void setup(void)
++{
++  // start serial port
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature IC Control Library Demo");
++
++  // Start up the library
++  sensors.begin();
++
++}
++
++void loop(void)
++{
++  // call sensors.requestTemperatures() to issue a global temperature
++  // request to all devices on the bus
++  Serial.print("Requesting temperatures...");
++  sensors.requestTemperatures(); // Send the command to get temperatures
++  Serial.println("DONE");
++
++  Serial.print("Temperature for the device 1 (index 0) is: ");
++  Serial.println(sensors.getTempCByIndex(0));
++
++  count++;
++  sensors.setUserDataByIndex(0, count);
++  int x = sensors.getUserDataByIndex(0);
++  Serial.println(count);
++}
+diff --git a/libraries/DallasTemperature/examples/Simple/Simple.ino b/libraries/DallasTemperature/examples/Simple/Simple.ino
+new file mode 100644
+index 00000000..1d7afab5
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/Simple/Simple.ino
+@@ -0,0 +1,51 @@
++// Include the libraries we need
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++/*
++ * The setup function. We only start the sensors here
++ */
++void setup(void)
++{
++  // start serial port
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature IC Control Library Demo");
++
++  // Start up the library
++  sensors.begin();
++}
++
++/*
++ * Main function, get and show the temperature
++ */
++void loop(void)
++{
++  // call sensors.requestTemperatures() to issue a global temperature
++  // request to all devices on the bus
++  Serial.print("Requesting temperatures...");
++  sensors.requestTemperatures(); // Send the command to get temperatures
++  Serial.println("DONE");
++  // After we got the temperatures, we can print them here.
++  // We use the function ByIndex, and as an example get the temperature from the first sensor only.
++  float tempC = sensors.getTempCByIndex(0);
++
++  // Check if reading was successful
++  if (tempC != DEVICE_DISCONNECTED_C)
++  {
++    Serial.print("Temperature for the device 1 (index 0) is: ");
++    Serial.println(tempC);
++  }
++  else
++  {
++    Serial.println("Error: Could not read temperature data");
++  }
++}
+diff --git a/libraries/DallasTemperature/examples/Single/Single.ino b/libraries/DallasTemperature/examples/Single/Single.ino
+new file mode 100644
+index 00000000..100514ba
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/Single/Single.ino
+@@ -0,0 +1,121 @@
++// Include the libraries we need
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++// arrays to hold device address
++DeviceAddress insideThermometer;
++
++/*
++ * Setup function. Here we do the basics
++ */
++void setup(void)
++{
++  // start serial port
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature IC Control Library Demo");
++
++  // locate devices on the bus
++  Serial.print("Locating devices...");
++  sensors.begin();
++  Serial.print("Found ");
++  Serial.print(sensors.getDeviceCount(), DEC);
++  Serial.println(" devices.");
++
++  // report parasite power requirements
++  Serial.print("Parasite power is: ");
++  if (sensors.isParasitePowerMode()) Serial.println("ON");
++  else Serial.println("OFF");
++
++  // Assign address manually. The addresses below will beed to be changed
++  // to valid device addresses on your bus. Device address can be retrieved
++  // by using either oneWire.search(deviceAddress) or individually via
++  // sensors.getAddress(deviceAddress, index)
++  // Note that you will need to use your specific address here
++  //insideThermometer = { 0x28, 0x1D, 0x39, 0x31, 0x2, 0x0, 0x0, 0xF0 };
++
++  // Method 1:
++  // Search for devices on the bus and assign based on an index. Ideally,
++  // you would do this to initially discover addresses on the bus and then
++  // use those addresses and manually assign them (see above) once you know
++  // the devices on your bus (and assuming they don't change).
++  if (!sensors.getAddress(insideThermometer, 0)) Serial.println("Unable to find address for Device 0");
++
++  // method 2: search()
++  // search() looks for the next device. Returns 1 if a new address has been
++  // returned. A zero might mean that the bus is shorted, there are no devices,
++  // or you have already retrieved all of them. It might be a good idea to
++  // check the CRC to make sure you didn't get garbage. The order is
++  // deterministic. You will always get the same devices in the same order
++  //
++  // Must be called before search()
++  //oneWire.reset_search();
++  // assigns the first address found to insideThermometer
++  //if (!oneWire.search(insideThermometer)) Serial.println("Unable to find address for insideThermometer");
++
++  // show the addresses we found on the bus
++  Serial.print("Device 0 Address: ");
++  printAddress(insideThermometer);
++  Serial.println();
++
++  // set the resolution to 9 bit (Each Dallas/Maxim device is capable of several different resolutions)
++  sensors.setResolution(insideThermometer, 9);
++
++  Serial.print("Device 0 Resolution: ");
++  Serial.print(sensors.getResolution(insideThermometer), DEC);
++  Serial.println();
++}
++
++// function to print the temperature for a device
++void printTemperature(DeviceAddress deviceAddress)
++{
++  // method 1 - slower
++  //Serial.print("Temp C: ");
++  //Serial.print(sensors.getTempC(deviceAddress));
++  //Serial.print(" Temp F: ");
++  //Serial.print(sensors.getTempF(deviceAddress)); // Makes a second call to getTempC and then converts to Fahrenheit
++
++  // method 2 - faster
++  float tempC = sensors.getTempC(deviceAddress);
++  if (tempC == DEVICE_DISCONNECTED_C)
++  {
++    Serial.println("Error: Could not read temperature data");
++    return;
++  }
++  Serial.print("Temp C: ");
++  Serial.print(tempC);
++  Serial.print(" Temp F: ");
++  Serial.println(DallasTemperature::toFahrenheit(tempC)); // Converts tempC to Fahrenheit
++}
++/*
++ * Main function. It will request the tempC from the sensors and display on Serial.
++ */
++void loop(void)
++{
++  // call sensors.requestTemperatures() to issue a global temperature
++  // request to all devices on the bus
++  Serial.print("Requesting temperatures...");
++  sensors.requestTemperatures(); // Send the command to get temperatures
++  Serial.println("DONE");
++
++  // It responds almost immediately. Let's print out the data
++  printTemperature(insideThermometer); // Use a simple function to print out the data
++}
++
++// function to print a device address
++void printAddress(DeviceAddress deviceAddress)
++{
++  for (uint8_t i = 0; i < 8; i++)
++  {
++    if (deviceAddress[i] < 16) Serial.print("0");
++    Serial.print(deviceAddress[i], HEX);
++  }
++}
+diff --git a/libraries/DallasTemperature/examples/Tester/Tester.ino b/libraries/DallasTemperature/examples/Tester/Tester.ino
+new file mode 100644
+index 00000000..35d2618b
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/Tester/Tester.ino
+@@ -0,0 +1,129 @@
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++#define TEMPERATURE_PRECISION 9 // Lower resolution
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++int numberOfDevices; // Number of temperature devices found
++
++DeviceAddress tempDeviceAddress; // We'll use this variable to store a found device address
++
++void setup(void)
++{
++  // start serial port
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature IC Control Library Demo");
++
++  // Start up the library
++  sensors.begin();
++
++  // Grab a count of devices on the wire
++  numberOfDevices = sensors.getDeviceCount();
++
++  // locate devices on the bus
++  Serial.print("Locating devices...");
++
++  Serial.print("Found ");
++  Serial.print(numberOfDevices, DEC);
++  Serial.println(" devices.");
++
++  // report parasite power requirements
++  Serial.print("Parasite power is: ");
++  if (sensors.isParasitePowerMode()) Serial.println("ON");
++  else Serial.println("OFF");
++
++  // Loop through each device, print out address
++  for (int i = 0; i < numberOfDevices; i++)
++  {
++    // Search the wire for address
++    if (sensors.getAddress(tempDeviceAddress, i))
++    {
++      Serial.print("Found device ");
++      Serial.print(i, DEC);
++      Serial.print(" with address: ");
++      printAddress(tempDeviceAddress);
++      Serial.println();
++
++      Serial.print("Setting resolution to ");
++      Serial.println(TEMPERATURE_PRECISION, DEC);
++
++      // set the resolution to TEMPERATURE_PRECISION bit (Each Dallas/Maxim device is capable of several different resolutions)
++      sensors.setResolution(tempDeviceAddress, TEMPERATURE_PRECISION);
++
++      Serial.print("Resolution actually set to: ");
++      Serial.print(sensors.getResolution(tempDeviceAddress), DEC);
++      Serial.println();
++    } else {
++      Serial.print("Found ghost device at ");
++      Serial.print(i, DEC);
++      Serial.print(" but could not detect address. Check power and cabling");
++    }
++  }
++
++}
++
++// function to print the temperature for a device
++void printTemperature(DeviceAddress deviceAddress)
++{
++  // method 1 - slower
++  //Serial.print("Temp C: ");
++  //Serial.print(sensors.getTempC(deviceAddress));
++  //Serial.print(" Temp F: ");
++  //Serial.print(sensors.getTempF(deviceAddress)); // Makes a second call to getTempC and then converts to Fahrenheit
++
++  // method 2 - faster
++  float tempC = sensors.getTempC(deviceAddress);
++  if (tempC == DEVICE_DISCONNECTED_C)
++  {
++    Serial.println("Error: Could not read temperature data");
++    return;
++  }
++  Serial.print("Temp C: ");
++  Serial.print(tempC);
++  Serial.print(" Temp F: ");
++  Serial.println(DallasTemperature::toFahrenheit(tempC)); // Converts tempC to Fahrenheit
++}
++
++void loop(void)
++{
++  // call sensors.requestTemperatures() to issue a global temperature
++  // request to all devices on the bus
++  Serial.print("Requesting temperatures...");
++  sensors.requestTemperatures(); // Send the command to get temperatures
++  Serial.println("DONE");
++
++
++  // Loop through each device, print out temperature data
++  for (int i = 0; i < numberOfDevices; i++)
++  {
++    // Search the wire for address
++    if (sensors.getAddress(tempDeviceAddress, i))
++    {
++      // Output the device ID
++      Serial.print("Temperature for device: ");
++      Serial.println(i, DEC);
++
++      // It responds almost immediately. Let's print out the data
++      printTemperature(tempDeviceAddress); // Use a simple function to print out the data
++    }
++    //else ghost device! Check your power requirements and cabling
++
++  }
++}
++
++// function to print a device address
++void printAddress(DeviceAddress deviceAddress)
++{
++  for (uint8_t i = 0; i < 8; i++)
++  {
++    if (deviceAddress[i] < 16) Serial.print("0");
++    Serial.print(deviceAddress[i], HEX);
++  }
++}
+diff --git a/libraries/DallasTemperature/examples/Timing/Timing.ino b/libraries/DallasTemperature/examples/Timing/Timing.ino
+new file mode 100644
+index 00000000..89ffcb13
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/Timing/Timing.ino
+@@ -0,0 +1,77 @@
++//
++//    FILE: Timing.ino
++//  AUTHOR: Rob Tillaart
++// VERSION: 0.0.3
++// PURPOSE: show performance of DallasTemperature lib
++//          compared to datasheet times per resolution
++//
++// HISTORY:
++// 0.0.1    2017-07-25 initial version
++// 0.0.2    2020-02-13 updates to work with current lib version
++// 0.0.3    2020-02-20 added timing measurement of setResolution
++
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++#define ONE_WIRE_BUS 2
++
++OneWire oneWire(ONE_WIRE_BUS);
++DallasTemperature sensor(&oneWire);
++
++uint32_t start, stop;
++
++
++void setup()
++{
++  Serial.begin(9600);
++  Serial.println(__FILE__);
++  Serial.print("DallasTemperature Library version: ");
++  Serial.println(DALLASTEMPLIBVERSION);
++
++  sensor.begin();
++}
++
++void loop()
++{
++  float ti[4] = { 94, 188, 375, 750 };
++
++  Serial.println();
++  Serial.println("Test takes about 30 seconds for 4 resolutions");
++  Serial.println("RES\tTIME\tACTUAL\tGAIN");
++  for (int r = 9; r < 13; r++)
++  {
++    start = micros();
++    sensor.setResolution(r);
++    Serial.println(micros() - start);
++
++    start = micros();
++    sensor.setResolution(r);
++    Serial.println(micros() - start);
++
++    uint32_t duration = run(20);
++    float avgDuration = duration / 20.0;
++
++    Serial.print(r);
++    Serial.print("\t");
++    Serial.print(ti[r - 9]);
++    Serial.print("\t");
++    Serial.print(avgDuration, 2);
++    Serial.print("\t");
++    Serial.print(avgDuration * 100 / ti[r - 9], 1);
++    Serial.println("%");
++  }
++  delay(1000);
++}
++
++uint32_t run(int runs)
++{
++  float t;
++  start = millis();
++  for (int i = 0; i < runs; i++)
++  {
++    sensor.requestTemperatures();
++    t = sensor.getTempCByIndex(0);
++  }
++  stop = millis();
++  return stop - start;
++}
+diff --git a/libraries/DallasTemperature/examples/TwoPin_DS18B20/TwoPin_DS18B20.ino b/libraries/DallasTemperature/examples/TwoPin_DS18B20/TwoPin_DS18B20.ino
+new file mode 100644
+index 00000000..61ba8cce
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/TwoPin_DS18B20/TwoPin_DS18B20.ino
+@@ -0,0 +1,45 @@
++//
++// FILE: TwoPin_DS18B20.ino
++// AUTHOR: Rob Tillaart
++// VERSION: 0.1.00
++// PURPOSE: two pins for two sensors demo
++// DATE: 2014-06-13
++// URL: http://forum.arduino.cc/index.php?topic=216835.msg1764333#msg1764333
++//
++// Released to the public domain
++//
++
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++#define ONE_WIRE_BUS_1 2
++#define ONE_WIRE_BUS_2 4
++
++OneWire oneWire_in(ONE_WIRE_BUS_1);
++OneWire oneWire_out(ONE_WIRE_BUS_2);
++
++DallasTemperature sensor_inhouse(&oneWire_in);
++DallasTemperature sensor_outhouse(&oneWire_out);
++
++void setup(void)
++{
++  Serial.begin(9600);
++  Serial.println("Dallas Temperature Control Library Demo - TwoPin_DS18B20");
++
++  sensor_inhouse.begin();
++  sensor_outhouse.begin();
++}
++
++void loop(void)
++{
++  Serial.print("Requesting temperatures...");
++  sensor_inhouse.requestTemperatures();
++  sensor_outhouse.requestTemperatures();
++  Serial.println(" done");
++
++  Serial.print("Inhouse: ");
++  Serial.println(sensor_inhouse.getTempCByIndex(0));
++
++  Serial.print("Outhouse: ");
++  Serial.println(sensor_outhouse.getTempCByIndex(0));
++}
+\ No newline at end of file
+diff --git a/libraries/DallasTemperature/examples/UserDataDemo/UserDataDemo.ino b/libraries/DallasTemperature/examples/UserDataDemo/UserDataDemo.ino
+new file mode 100644
+index 00000000..152dcf2d
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/UserDataDemo/UserDataDemo.ino
+@@ -0,0 +1,115 @@
++//
++// FILE: UserDataDemo.ino
++// AUTHOR: Rob Tillaart
++// VERSION: 0.1.0
++// PURPOSE: use of alarm field as user identification demo
++// DATE: 2019-12-23
++// URL:
++//
++// Released to the public domain
++//
++
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++#define ONE_WIRE_BUS      2
++
++OneWire oneWire(ONE_WIRE_BUS);
++DallasTemperature sensors(&oneWire);
++
++uint8_t deviceCount = 0;
++
++// Add 4 prepared sensors to the bus
++// use the UserDataWriteBatch demo to prepare 4 different labeled sensors
++struct
++{
++  int id;
++  DeviceAddress addr;
++} T[4];
++
++float getTempByID(int id)
++{
++  for (uint8_t index = 0; index < deviceCount; index++)
++  {
++    if (T[index].id == id)
++    {
++      return sensors.getTempC(T[index].addr);
++    }
++  }
++  return -999;
++}
++
++void printAddress(DeviceAddress deviceAddress)
++{
++  for (uint8_t i = 0; i < 8; i++)
++  {
++    // zero pad the address if necessary
++    if (deviceAddress[i] < 16) Serial.print("0");
++    Serial.print(deviceAddress[i], HEX);
++  }
++}
++
++void setup(void)
++{
++  Serial.begin(115200);
++  Serial.println(__FILE__);
++  Serial.println("Dallas Temperature Demo");
++
++  sensors.begin();
++
++  // count devices
++  deviceCount = sensors.getDeviceCount();
++  Serial.print("#devices: ");
++  Serial.println(deviceCount);
++
++  // Read ID's per sensor
++  // and put them in T array
++  for (uint8_t index = 0; index < deviceCount; index++)
++  {
++    // go through sensors
++    sensors.getAddress(T[index].addr, index);
++    T[index].id = sensors.getUserData(T[index].addr);
++  }
++
++  // Check all 4 sensors are set
++  for (uint8_t index = 0; index < deviceCount; index++)
++  {
++    Serial.println();
++    Serial.println(T[index].id);
++    printAddress(T[index].addr);
++    Serial.println();
++  }
++  Serial.println();
++
++}
++
++
++void loop(void)
++{
++  Serial.println();
++  Serial.print(millis());
++  Serial.println("\treq temp");
++  sensors.requestTemperatures();
++
++  Serial.print(millis());
++  Serial.println("\tGet temp by address");
++  for (int i = 0; i < 4; i++)
++  {
++    Serial.print(millis());
++    Serial.print("\t temp:\t");
++    Serial.println(sensors.getTempC(T[i].addr));
++  }
++
++  Serial.print(millis());
++  Serial.println("\tGet temp by ID");  // assume ID = 0, 1, 2, 3
++  for (int id = 0; id < 4; id++)
++  {
++    Serial.print(millis());
++    Serial.print("\t temp:\t");
++    Serial.println(getTempByID(id));
++  }
++
++  delay(1000);
++}
++
++// END OF FILE
+\ No newline at end of file
+diff --git a/libraries/DallasTemperature/examples/UserDataWriteBatch/UserDataWriteBatch.ino b/libraries/DallasTemperature/examples/UserDataWriteBatch/UserDataWriteBatch.ino
+new file mode 100644
+index 00000000..e0eb6de5
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/UserDataWriteBatch/UserDataWriteBatch.ino
+@@ -0,0 +1,107 @@
++//
++// FILE: UserDataWriteBatch.ino
++// AUTHOR: Rob Tillaart
++// VERSION: 0.1.0
++// PURPOSE: use of alarm field as user identification demo
++// DATE: 2019-12-23
++// URL:
++//
++// Released to the public domain
++//
++
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++#define ONE_WIRE_BUS      2
++
++OneWire oneWire(ONE_WIRE_BUS);
++DallasTemperature sensors(&oneWire);
++
++uint8_t deviceCount = 0;
++
++void printAddress(DeviceAddress deviceAddress)
++{
++  for (uint8_t i = 0; i < 8; i++)
++  {
++    // zero pad the address if necessary
++    if (deviceAddress[i] < 16) Serial.print("0");
++    Serial.print(deviceAddress[i], HEX);
++  }
++}
++
++
++
++void setup(void)
++{
++  Serial.begin(115200);
++  Serial.println(__FILE__);
++  Serial.println("Write user ID to DS18B20\n");
++
++  sensors.begin();
++
++  // count devices
++  deviceCount = sensors.getDeviceCount();
++  Serial.print("#devices: ");
++  Serial.println(deviceCount);
++
++  Serial.println();
++  Serial.println("current ID's");
++  for (uint8_t index = 0; index < deviceCount; index++)
++  {
++    DeviceAddress t;
++    sensors.getAddress(t, index);
++    printAddress(t);
++    Serial.print("\t\tID: ");
++    int id = sensors.getUserData(t);
++    Serial.println(id);
++  }
++
++  Serial.println();
++  Serial.print("Enter ID for batch: ");
++  int c = 0;
++  int id = 0;
++  while (c != '\n' && c != '\r')
++  {
++    c = Serial.read();
++    switch (c)
++    {
++    case '0'...'9':
++      id *= 10;
++      id += (c - '0');
++      break;
++    default:
++      break;
++    }
++  }
++  Serial.println();
++  Serial.println(id);
++  Serial.println();
++
++  Serial.println("Start labeling ...");
++  for (uint8_t index = 0; index < deviceCount; index++)
++  {
++    Serial.print(".");
++    DeviceAddress t;
++    sensors.getAddress(t, index);
++    sensors.setUserData(t, id);
++  }
++  Serial.println();
++
++  Serial.println();
++  Serial.println("Show results ...");
++  for (uint8_t index = 0; index < deviceCount; index++)
++  {
++    DeviceAddress t;
++    sensors.getAddress(t, index);
++    printAddress(t);
++    Serial.print("\t\tID: ");
++    int id = sensors.getUserData(t);
++    Serial.println(id);
++  }
++  Serial.println("Done ...");
++
++}
++
++void loop(void) {}
++
++// END OF FILE
+\ No newline at end of file
+diff --git a/libraries/DallasTemperature/examples/WaitForConversion/WaitForConversion.ino b/libraries/DallasTemperature/examples/WaitForConversion/WaitForConversion.ino
+new file mode 100644
+index 00000000..4dd629db
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/WaitForConversion/WaitForConversion.ino
+@@ -0,0 +1,66 @@
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++void setup(void)
++{
++  // start serial port
++  Serial.begin(115200);
++  Serial.println("Dallas Temperature Control Library - Async Demo");
++  Serial.println("\nDemo shows the difference in length of the call\n\n");
++
++  // Start up the library
++  sensors.begin();
++}
++
++void loop(void)
++{
++  // Request temperature conversion (traditional)
++  Serial.println("Before blocking requestForConversion");
++  unsigned long start = millis();
++
++  sensors.requestTemperatures();
++
++  unsigned long stop = millis();
++  Serial.println("After blocking requestForConversion");
++  Serial.print("Time used: ");
++  Serial.println(stop - start);
++
++  // get temperature
++  Serial.print("Temperature: ");
++  Serial.println(sensors.getTempCByIndex(0));
++  Serial.println("\n");
++
++  // Request temperature conversion - non-blocking / async
++  Serial.println("Before NON-blocking/async requestForConversion");
++  start = millis();
++  sensors.setWaitForConversion(false);  // makes it async
++  sensors.requestTemperatures();
++  sensors.setWaitForConversion(true);
++  stop = millis();
++  Serial.println("After NON-blocking/async requestForConversion");
++  Serial.print("Time used: ");
++  Serial.println(stop - start);
++
++
++  // 9 bit resolution by default
++  // Note the programmer is responsible for the right delay
++  // we could do something usefull here instead of the delay
++  int resolution = 9;
++  delay(750 / (1 << (12 - resolution)));
++
++  // get temperature
++  Serial.print("Temperature: ");
++  Serial.println(sensors.getTempCByIndex(0));
++  Serial.println("\n\n\n\n");
++
++  delay(5000);
++}
+diff --git a/libraries/DallasTemperature/examples/WaitForConversion2/WaitForConversion2.ino b/libraries/DallasTemperature/examples/WaitForConversion2/WaitForConversion2.ino
+new file mode 100644
+index 00000000..3409a745
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/WaitForConversion2/WaitForConversion2.ino
+@@ -0,0 +1,80 @@
++//
++// Sample of using Async reading of Dallas Temperature Sensors
++//
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++
++// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++DeviceAddress tempDeviceAddress;
++
++int  resolution = 12;
++unsigned long lastTempRequest = 0;
++int  delayInMillis = 0;
++float temperature = 0.0;
++int  idle = 0;
++//
++// SETUP
++//
++void setup(void)
++{
++  Serial.begin(115200);
++  Serial.println("Dallas Temperature Control Library - Async Demo");
++  Serial.print("Library Version: ");
++  Serial.println(DALLASTEMPLIBVERSION);
++  Serial.println("\n");
++
++  sensors.begin();
++  sensors.getAddress(tempDeviceAddress, 0);
++  sensors.setResolution(tempDeviceAddress, resolution);
++
++  sensors.setWaitForConversion(false);
++  sensors.requestTemperatures();
++  delayInMillis = 750 / (1 << (12 - resolution));
++  lastTempRequest = millis();
++
++  pinMode(13, OUTPUT);
++}
++
++void loop(void)
++{
++
++  if (millis() - lastTempRequest >= delayInMillis) // waited long enough??
++  {
++    digitalWrite(13, LOW);
++    Serial.print(" Temperature: ");
++    temperature = sensors.getTempCByIndex(0);
++    Serial.println(temperature, resolution - 8);
++    Serial.print("  Resolution: ");
++    Serial.println(resolution);
++    Serial.print("Idle counter: ");
++    Serial.println(idle);
++    Serial.println();
++
++    idle = 0;
++
++    // immediately after fetching the temperature we request a new sample
++    // in the async modus
++    // for the demo we let the resolution change to show differences
++    resolution++;
++    if (resolution > 12) resolution = 9;
++
++    sensors.setResolution(tempDeviceAddress, resolution);
++    sensors.requestTemperatures();
++    delayInMillis = 750 / (1 << (12 - resolution));
++    lastTempRequest = millis();
++  }
++
++  digitalWrite(13, HIGH);
++  // we can do usefull things here
++  // for the demo we just count the idle time in millis
++  delay(1);
++  idle++;
++}
+diff --git a/libraries/DallasTemperature/examples/oneWireSearch/oneWireSearch.ino b/libraries/DallasTemperature/examples/oneWireSearch/oneWireSearch.ino
+new file mode 100644
+index 00000000..44da6192
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/oneWireSearch/oneWireSearch.ino
+@@ -0,0 +1,67 @@
++//
++//    FILE: oneWireSearch.ino
++//  AUTHOR: Rob Tillaart
++// VERSION: 0.1.02
++// PURPOSE: scan for 1-Wire devices + code snippet generator
++//    DATE: 2015-june-30
++//     URL: http://forum.arduino.cc/index.php?topic=333923
++//
++// inspired by http://www.hacktronics.com/Tutorials/arduino-1-wire-address-finder.html
++//
++// Released to the public domain
++//
++// 0.1.00 initial version
++// 0.1.01 first published version
++// 0.1.02 small output changes
++
++#include <OneWire.h>
++
++void setup()
++{
++  Serial.begin(115200);
++  Serial.println("//\n// Start oneWireSearch.ino \n//");
++
++  for (uint8_t pin = 2; pin < 13; pin++)
++  {
++    findDevices(pin);
++  }
++  Serial.println("\n//\n// End oneWireSearch.ino \n//");
++}
++
++void loop()
++{
++}
++
++uint8_t findDevices(int pin)
++{
++  OneWire ow(pin);
++
++  uint8_t address[8];
++  uint8_t count = 0;
++
++
++  if (ow.search(address))
++  {
++    Serial.print("\nuint8_t pin");
++    Serial.print(pin, DEC);
++    Serial.println("[][8] = {");
++    do {
++      count++;
++      Serial.println("  {");
++      for (uint8_t i = 0; i < 8; i++)
++      {
++        Serial.print("0x");
++        if (address[i] < 0x10) Serial.print("0");
++        Serial.print(address[i], HEX);
++        if (i < 7) Serial.print(", ");
++      }
++      Serial.println("  },");
++    } while (ow.search(address));
++
++    Serial.println("};");
++    Serial.print("// nr devices found: ");
++    Serial.println(count);
++  }
++
++  return count;
++}
+diff --git a/libraries/DallasTemperature/examples/readPowerSupply/readPowerSupply.ino b/libraries/DallasTemperature/examples/readPowerSupply/readPowerSupply.ino
+new file mode 100644
+index 00000000..39a3aeb3
+--- /dev/null
++++ b/libraries/DallasTemperature/examples/readPowerSupply/readPowerSupply.ino
+@@ -0,0 +1,92 @@
++//
++// FILE: readPowerSupply.ino
++// AUTHOR: Rob Tillaart
++// VERSION: 0.1.0
++// PURPOSE: demo
++// DATE: 2020-02-10
++//
++// Released to the public domain
++//
++
++// Include the libraries we need
++#include <OneWire.h>
++#include <DallasTemperature.h>
++
++// Data wire is plugged into port 2 on the Arduino
++#define ONE_WIRE_BUS 2
++
++// Setup a oneWire instance to communicate with any OneWire devices
++OneWire oneWire(ONE_WIRE_BUS);
++
++// Pass our oneWire reference to Dallas Temperature.
++DallasTemperature sensors(&oneWire);
++
++// arrays to hold device addresses
++DeviceAddress insideThermometer, outsideThermometer;
++// Assign address manually. The addresses below will beed to be changed
++// to valid device addresses on your bus. Device address can be retrieved
++// by using either oneWire.search(deviceAddress) or individually via
++// sensors.getAddress(deviceAddress, index)
++// DeviceAddress insideThermometer = { 0x28, 0x1D, 0x39, 0x31, 0x2, 0x0, 0x0, 0xF0 };
++// DeviceAddress outsideThermometer   = { 0x28, 0x3F, 0x1C, 0x31, 0x2, 0x0, 0x0, 0x2 };
++
++int devCount = 0;
++
++/*
++ * The setup function. We only start the sensors here
++ */
++void setup(void)
++{
++  Serial.begin(115200);
++  Serial.println("Arduino Temperature Control Library Demo - readPowerSupply");
++
++  sensors.begin();
++
++  devCount = sensors.getDeviceCount();
++  Serial.print("#devices: ");
++  Serial.println(devCount);
++
++  // report parasite power requirements
++  Serial.print("Parasite power is: ");
++  if (sensors.readPowerSupply()) Serial.println("ON");  // no address means "scan all devices for parasite mode"
++  else Serial.println("OFF");
++
++  // Search for devices on the bus and assign based on an index.
++  if (!sensors.getAddress(insideThermometer, 0)) Serial.println("Unable to find address for Device 0");
++  if (!sensors.getAddress(outsideThermometer, 1)) Serial.println("Unable to find address for Device 1");
++
++  // show the addresses we found on the bus
++  Serial.print("Device 0 Address: ");
++  printAddress(insideThermometer);
++  Serial.println();
++  Serial.print("Power = parasite: ");
++  Serial.println(sensors.readPowerSupply(insideThermometer));
++  Serial.println();
++  Serial.println();
++
++  Serial.print("Device 1 Address: ");
++  printAddress(outsideThermometer);
++  Serial.println();
++  Serial.print("Power = parasite: ");
++  Serial.println(sensors.readPowerSupply(outsideThermometer));
++  Serial.println();
++  Serial.println();
++}
++
++// function to print a device address
++void printAddress(DeviceAddress deviceAddress)
++{
++  for (uint8_t i = 0; i < 8; i++)
++  {
++    // zero pad the address if necessary
++    if (deviceAddress[i] < 0x10) Serial.print("0");
++    Serial.print(deviceAddress[i], HEX);
++  }
++}
++
++// empty on purpose
++void loop(void)
++{
++}
++
++// END OF FILE
+\ No newline at end of file
+diff --git a/libraries/DallasTemperature/keywords.txt b/libraries/DallasTemperature/keywords.txt
+new file mode 100644
+index 00000000..a471c3ee
+--- /dev/null
++++ b/libraries/DallasTemperature/keywords.txt
+@@ -0,0 +1,87 @@
++#######################################
++# Syntax Coloring Map For DallasTemperature
++#######################################
++
++#######################################
++# Datatypes (KEYWORD1)
++#######################################
++DallasTemperature	KEYWORD1
++OneWire	KEYWORD1
++AlarmHandler	KEYWORD1
++DeviceAddress	KEYWORD1
++
++#######################################
++# Methods and Functions (KEYWORD2)
++#######################################
++
++setOneWire	KEYWORD2
++setPullupPin	KEYWORD2
++setResolution	KEYWORD2
++getResolution	KEYWORD2
++getTemp	KEYWORD2
++getTempC	KEYWORD2
++toFahrenheit	KEYWORD2
++getTempF	KEYWORD2
++getTempCByIndex	KEYWORD2
++getTempFByIndex	KEYWORD2
++rawToCelsius	KEYWORD2
++rawToFahrenheit	KEYWORD2
++setWaitForConversion	KEYWORD2
++getWaitForConversion	KEYWORD2
++requestTemperatures	KEYWORD2
++requestTemperaturesByAddress	KEYWORD2
++requestTemperaturesByIndex	KEYWORD2
++setCheckForConversion	KEYWORD2
++getCheckForConversion	KEYWORD2
++isConversionComplete	KEYWORD2
++millisToWaitForConversion	KEYWORD2
++isParasitePowerMode	KEYWORD2
++begin	KEYWORD2
++getDeviceCount	KEYWORD2
++getDS18Count	KEYWORD2
++getAddress	KEYWORD2
++validAddress	KEYWORD2
++validFamily	KEYWORD2
++isConnected	KEYWORD2
++readScratchPad	KEYWORD2
++writeScratchPad	KEYWORD2
++readPowerSupply	KEYWORD2
++saveScratchPadByIndex	KEYWORD2
++saveScratchPad	KEYWORD2
++recallScratchPadByIndex	KEYWORD2
++recallScratchPad	KEYWORD2
++setAutoSaveScratchPad	KEYWORD2
++getAutoSaveScratchPad	KEYWORD2
++setHighAlarmTemp	KEYWORD2
++setLowAlarmTemp	KEYWORD2
++getHighAlarmTemp	KEYWORD2
++getLowAlarmTemp	KEYWORD2
++resetAlarmSearch	KEYWORD2
++alarmSearch	KEYWORD2
++hasAlarm	KEYWORD2
++toCelsius	KEYWORD2
++processAlarms	KEYWORD2
++setAlarmHandler	KEYWORD2
++hasAlarmHandler	KEYWORD2
++setUserData	KEYWORD2
++setUserDataByIndex	KEYWORD2
++getUserData	KEYWORD2
++getUserDataByIndex	KEYWORD2
++calculateTemperature	KEYWORD2
++
++#######################################
++# Constants (LITERAL1)
++#######################################
++
++DEVICE_DISCONNECTED_C	LITERAL1
++DEVICE_DISCONNECTED_F	LITERAL1
++DEVICE_DISCONNECTED_RAW	LITERAL1
++DEVICE_FAULT_OPEN_C	LITERAL1
++DEVICE_FAULT_OPEN_F	LITERAL1
++DEVICE_FAULT_OPEN_RAW	LITERAL1
++DEVICE_FAULT_SHORTGND_C	LITERAL1
++DEVICE_FAULT_SHORTGND_F	LITERAL1
++DEVICE_FAULT_SHORTGND_RAW	LITERAL1
++DEVICE_FAULT_SHORTVDD_C	LITERAL1
++DEVICE_FAULT_SHORTVDD_F	LITERAL1
++DEVICE_FAULT_SHORTVDD_RAW	LITERAL1
+diff --git a/libraries/DallasTemperature/library.json b/libraries/DallasTemperature/library.json
+new file mode 100644
+index 00000000..e88bd16d
+--- /dev/null
++++ b/libraries/DallasTemperature/library.json
+@@ -0,0 +1,38 @@
++{
++  "name": "DallasTemperature",
++  "keywords": "onewire, 1-wire, bus, sensor, temperature",
++  "description": "Arduino Library for Dallas Temperature ICs (DS18B20, DS18S20, DS1822, DS1820, MAX31850)",
++  "repository":
++  {
++    "type": "git",
++    "url": "https://github.com/milesburton/Arduino-Temperature-Control-Library.git"
++  },
++  "authors": 
++  [
++    {
++      "name": "Miles Burton",
++      "email": "miles@mnetcs.com",
++      "url": "http://www.milesburton.com",
++      "maintainer": true
++    },
++    {
++      "name": "Tim Newsome",
++      "email": "nuisance@casualhacker.net"
++    },
++    {
++      "name": "Guil Barros",
++      "email": "gfbarros@bappos.com"
++    },
++    {
++      "name": "Rob Tillaart",
++      "email": "rob.tillaart@gmail.com"
++    }
++  ],
++  "dependencies":
++  {
++    "paulstoffregen/OneWire": "^2.3.5"
++  },
++  "version": "3.11.0",
++  "frameworks": "arduino",
++  "platforms": "*"
++}
+diff --git a/libraries/DallasTemperature/library.properties b/libraries/DallasTemperature/library.properties
+new file mode 100644
+index 00000000..ef3c89f6
+--- /dev/null
++++ b/libraries/DallasTemperature/library.properties
+@@ -0,0 +1,10 @@
++name=DallasTemperature
++version=3.11.0
++author=Miles Burton <miles@mnetcs.com>, Tim Newsome <nuisance@casualhacker.net>, Guil Barros <gfbarros@bappos.com>, Rob Tillaart <rob.tillaart@gmail.com>
++maintainer=Miles Burton <miles@mnetcs.com>
++sentence=Arduino Library for Dallas Temperature ICs
++paragraph=Supports DS18B20, DS18S20, DS1822, DS1820, MAX31850
++category=Sensors
++url=https://github.com/milesburton/Arduino-Temperature-Control-Library
++architectures=*
++depends=OneWire
+diff --git a/libraries/OneWire/.piopm b/libraries/OneWire/.piopm
+new file mode 100644
+index 00000000..2c1f351c
+--- /dev/null
++++ b/libraries/OneWire/.piopm
+@@ -0,0 +1 @@
++{"type": "library", "name": "OneWire", "version": "2.3.7", "spec": {"owner": "paulstoffregen", "id": 1, "name": "OneWire", "requirements": null, "uri": null}}
+\ No newline at end of file
+diff --git a/libraries/OneWire/OneWire.cpp b/libraries/OneWire/OneWire.cpp
+new file mode 100644
+index 00000000..38bf4ee2
+--- /dev/null
++++ b/libraries/OneWire/OneWire.cpp
+@@ -0,0 +1,580 @@
++/*
++Copyright (c) 2007, Jim Studt  (original old version - many contributors since)
++
++The latest version of this library may be found at:
++  http://www.pjrc.com/teensy/td_libs_OneWire.html
++
++OneWire has been maintained by Paul Stoffregen (paul@pjrc.com) since
++January 2010.
++
++DO NOT EMAIL for technical support, especially not for ESP chips!
++All project support questions must be posted on public forums
++relevant to the board or chips used.  If using Arduino, post on
++Arduino's forum.  If using ESP, post on the ESP community forums.
++There is ABSOLUTELY NO TECH SUPPORT BY PRIVATE EMAIL!
++
++Github's issue tracker for OneWire should be used only to report
++specific bugs.  DO NOT request project support via Github.  All
++project and tech support questions must be posted on forums, not
++github issues.  If you experience a problem and you are not
++absolutely sure it's an issue with the library, ask on a forum
++first.  Only use github to report issues after experts have
++confirmed the issue is with OneWire rather than your project.
++
++Back in 2010, OneWire was in need of many bug fixes, but had
++been abandoned the original author (Jim Studt).  None of the known
++contributors were interested in maintaining OneWire.  Paul typically
++works on OneWire every 6 to 12 months.  Patches usually wait that
++long.  If anyone is interested in more actively maintaining OneWire,
++please contact Paul (this is pretty much the only reason to use
++private email about OneWire).
++
++OneWire is now very mature code.  No changes other than adding
++definitions for newer hardware support are anticipated.
++
++Version 2.3:
++  Unknown chip fallback mode, Roger Clark
++  Teensy-LC compatibility, Paul Stoffregen
++  Search bug fix, Love Nystrom
++
++Version 2.2:
++  Teensy 3.0 compatibility, Paul Stoffregen, paul@pjrc.com
++  Arduino Due compatibility, http://arduino.cc/forum/index.php?topic=141030
++  Fix DS18B20 example negative temperature
++  Fix DS18B20 example's low res modes, Ken Butcher
++  Improve reset timing, Mark Tillotson
++  Add const qualifiers, Bertrik Sikken
++  Add initial value input to crc16, Bertrik Sikken
++  Add target_search() function, Scott Roberts
++
++Version 2.1:
++  Arduino 1.0 compatibility, Paul Stoffregen
++  Improve temperature example, Paul Stoffregen
++  DS250x_PROM example, Guillermo Lovato
++  PIC32 (chipKit) compatibility, Jason Dangel, dangel.jason AT gmail.com
++  Improvements from Glenn Trewitt:
++  - crc16() now works
++  - check_crc16() does all of calculation/checking work.
++  - Added read_bytes() and write_bytes(), to reduce tedious loops.
++  - Added ds2408 example.
++  Delete very old, out-of-date readme file (info is here)
++
++Version 2.0: Modifications by Paul Stoffregen, January 2010:
++http://www.pjrc.com/teensy/td_libs_OneWire.html
++  Search fix from Robin James
++    http://www.arduino.cc/cgi-bin/yabb2/YaBB.pl?num=1238032295/27#27
++  Use direct optimized I/O in all cases
++  Disable interrupts during timing critical sections
++    (this solves many random communication errors)
++  Disable interrupts during read-modify-write I/O
++  Reduce RAM consumption by eliminating unnecessary
++    variables and trimming many to 8 bits
++  Optimize both crc8 - table version moved to flash
++
++Modified to work with larger numbers of devices - avoids loop.
++Tested in Arduino 11 alpha with 12 sensors.
++26 Sept 2008 -- Robin James
++http://www.arduino.cc/cgi-bin/yabb2/YaBB.pl?num=1238032295/27#27
++
++Updated to work with arduino-0008 and to include skip() as of
++2007/07/06. --RJL20
++
++Modified to calculate the 8-bit CRC directly, avoiding the need for
++the 256-byte lookup table to be loaded in RAM.  Tested in arduino-0010
++-- Tom Pollard, Jan 23, 2008
++
++Jim Studt's original library was modified by Josh Larios.
++
++Tom Pollard, pollard@alum.mit.edu, contributed around May 20, 2008
++
++Permission is hereby granted, free of charge, to any person obtaining
++a copy of this software and associated documentation files (the
++"Software"), to deal in the Software without restriction, including
++without limitation the rights to use, copy, modify, merge, publish,
++distribute, sublicense, and/or sell copies of the Software, and to
++permit persons to whom the Software is furnished to do so, subject to
++the following conditions:
++
++The above copyright notice and this permission notice shall be
++included in all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++
++Much of the code was inspired by Derek Yerger's code, though I don't
++think much of that remains.  In any event that was..
++    (copyleft) 2006 by Derek Yerger - Free to distribute freely.
++
++The CRC code was excerpted and inspired by the Dallas Semiconductor
++sample code bearing this copyright.
++//---------------------------------------------------------------------------
++// Copyright (C) 2000 Dallas Semiconductor Corporation, All Rights Reserved.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a
++// copy of this software and associated documentation files (the "Software"),
++// to deal in the Software without restriction, including without limitation
++// the rights to use, copy, modify, merge, publish, distribute, sublicense,
++// and/or sell copies of the Software, and to permit persons to whom the
++// Software is furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included
++// in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
++// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY,  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++// IN NO EVENT SHALL DALLAS SEMICONDUCTOR BE LIABLE FOR ANY CLAIM, DAMAGES
++// OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++// ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++// OTHER DEALINGS IN THE SOFTWARE.
++//
++// Except as contained in this notice, the name of Dallas Semiconductor
++// shall not be used except as stated in the Dallas Semiconductor
++// Branding Policy.
++//--------------------------------------------------------------------------
++*/
++
++#include <Arduino.h>
++#include "OneWire.h"
++#include "util/OneWire_direct_gpio.h"
++
++
++void OneWire::begin(uint8_t pin)
++{
++	pinMode(pin, INPUT);
++	bitmask = PIN_TO_BITMASK(pin);
++	baseReg = PIN_TO_BASEREG(pin);
++#if ONEWIRE_SEARCH
++	reset_search();
++#endif
++}
++
++
++// Perform the onewire reset function.  We will wait up to 250uS for
++// the bus to come high, if it doesn't then it is broken or shorted
++// and we return a 0;
++//
++// Returns 1 if a device asserted a presence pulse, 0 otherwise.
++//
++uint8_t OneWire::reset(void)
++{
++	IO_REG_TYPE mask IO_REG_MASK_ATTR = bitmask;
++	volatile IO_REG_TYPE *reg IO_REG_BASE_ATTR = baseReg;
++	uint8_t r;
++	uint8_t retries = 125;
++
++	noInterrupts();
++	DIRECT_MODE_INPUT(reg, mask);
++	interrupts();
++	// wait until the wire is high... just in case
++	do {
++		if (--retries == 0) return 0;
++		delayMicroseconds(2);
++	} while ( !DIRECT_READ(reg, mask));
++
++	noInterrupts();
++	DIRECT_WRITE_LOW(reg, mask);
++	DIRECT_MODE_OUTPUT(reg, mask);	// drive output low
++	interrupts();
++	delayMicroseconds(480);
++	noInterrupts();
++	DIRECT_MODE_INPUT(reg, mask);	// allow it to float
++	delayMicroseconds(70);
++	r = !DIRECT_READ(reg, mask);
++	interrupts();
++	delayMicroseconds(410);
++	return r;
++}
++
++//
++// Write a bit. Port and bit is used to cut lookup time and provide
++// more certain timing.
++//
++void OneWire::write_bit(uint8_t v)
++{
++	IO_REG_TYPE mask IO_REG_MASK_ATTR = bitmask;
++	volatile IO_REG_TYPE *reg IO_REG_BASE_ATTR = baseReg;
++
++	if (v & 1) {
++		noInterrupts();
++		DIRECT_WRITE_LOW(reg, mask);
++		DIRECT_MODE_OUTPUT(reg, mask);	// drive output low
++		delayMicroseconds(10);
++		DIRECT_WRITE_HIGH(reg, mask);	// drive output high
++		interrupts();
++		delayMicroseconds(55);
++	} else {
++		noInterrupts();
++		DIRECT_WRITE_LOW(reg, mask);
++		DIRECT_MODE_OUTPUT(reg, mask);	// drive output low
++		delayMicroseconds(65);
++		DIRECT_WRITE_HIGH(reg, mask);	// drive output high
++		interrupts();
++		delayMicroseconds(5);
++	}
++}
++
++//
++// Read a bit. Port and bit is used to cut lookup time and provide
++// more certain timing.
++//
++uint8_t OneWire::read_bit(void)
++{
++	IO_REG_TYPE mask IO_REG_MASK_ATTR = bitmask;
++	volatile IO_REG_TYPE *reg IO_REG_BASE_ATTR = baseReg;
++	uint8_t r;
++
++	noInterrupts();
++	DIRECT_MODE_OUTPUT(reg, mask);
++	DIRECT_WRITE_LOW(reg, mask);
++	delayMicroseconds(3);
++	DIRECT_MODE_INPUT(reg, mask);	// let pin float, pull up will raise
++	delayMicroseconds(10);
++	r = DIRECT_READ(reg, mask);
++	interrupts();
++	delayMicroseconds(53);
++	return r;
++}
++
++//
++// Write a byte. The writing code uses the active drivers to raise the
++// pin high, if you need power after the write (e.g. DS18S20 in
++// parasite power mode) then set 'power' to 1, otherwise the pin will
++// go tri-state at the end of the write to avoid heating in a short or
++// other mishap.
++//
++void OneWire::write(uint8_t v, uint8_t power /* = 0 */) {
++    uint8_t bitMask;
++
++    for (bitMask = 0x01; bitMask; bitMask <<= 1) {
++	OneWire::write_bit( (bitMask & v)?1:0);
++    }
++    if ( !power) {
++	noInterrupts();
++	DIRECT_MODE_INPUT(baseReg, bitmask);
++	DIRECT_WRITE_LOW(baseReg, bitmask);
++	interrupts();
++    }
++}
++
++void OneWire::write_bytes(const uint8_t *buf, uint16_t count, bool power /* = 0 */) {
++  for (uint16_t i = 0 ; i < count ; i++)
++    write(buf[i]);
++  if (!power) {
++    noInterrupts();
++    DIRECT_MODE_INPUT(baseReg, bitmask);
++    DIRECT_WRITE_LOW(baseReg, bitmask);
++    interrupts();
++  }
++}
++
++//
++// Read a byte
++//
++uint8_t OneWire::read() {
++    uint8_t bitMask;
++    uint8_t r = 0;
++
++    for (bitMask = 0x01; bitMask; bitMask <<= 1) {
++	if ( OneWire::read_bit()) r |= bitMask;
++    }
++    return r;
++}
++
++void OneWire::read_bytes(uint8_t *buf, uint16_t count) {
++  for (uint16_t i = 0 ; i < count ; i++)
++    buf[i] = read();
++}
++
++//
++// Do a ROM select
++//
++void OneWire::select(const uint8_t rom[8])
++{
++    uint8_t i;
++
++    write(0x55);           // Choose ROM
++
++    for (i = 0; i < 8; i++) write(rom[i]);
++}
++
++//
++// Do a ROM skip
++//
++void OneWire::skip()
++{
++    write(0xCC);           // Skip ROM
++}
++
++void OneWire::depower()
++{
++	noInterrupts();
++	DIRECT_MODE_INPUT(baseReg, bitmask);
++	interrupts();
++}
++
++#if ONEWIRE_SEARCH
++
++//
++// You need to use this function to start a search again from the beginning.
++// You do not need to do it for the first search, though you could.
++//
++void OneWire::reset_search()
++{
++  // reset the search state
++  LastDiscrepancy = 0;
++  LastDeviceFlag = false;
++  LastFamilyDiscrepancy = 0;
++  for(int i = 7; ; i--) {
++    ROM_NO[i] = 0;
++    if ( i == 0) break;
++  }
++}
++
++// Setup the search to find the device type 'family_code' on the next call
++// to search(*newAddr) if it is present.
++//
++void OneWire::target_search(uint8_t family_code)
++{
++   // set the search state to find SearchFamily type devices
++   ROM_NO[0] = family_code;
++   for (uint8_t i = 1; i < 8; i++)
++      ROM_NO[i] = 0;
++   LastDiscrepancy = 64;
++   LastFamilyDiscrepancy = 0;
++   LastDeviceFlag = false;
++}
++
++//
++// Perform a search. If this function returns a '1' then it has
++// enumerated the next device and you may retrieve the ROM from the
++// OneWire::address variable. If there are no devices, no further
++// devices, or something horrible happens in the middle of the
++// enumeration then a 0 is returned.  If a new device is found then
++// its address is copied to newAddr.  Use OneWire::reset_search() to
++// start over.
++//
++// --- Replaced by the one from the Dallas Semiconductor web site ---
++//--------------------------------------------------------------------------
++// Perform the 1-Wire Search Algorithm on the 1-Wire bus using the existing
++// search state.
++// Return TRUE  : device found, ROM number in ROM_NO buffer
++//        FALSE : device not found, end of search
++//
++bool OneWire::search(uint8_t *newAddr, bool search_mode /* = true */)
++{
++   uint8_t id_bit_number;
++   uint8_t last_zero, rom_byte_number;
++   bool    search_result;
++   uint8_t id_bit, cmp_id_bit;
++
++   unsigned char rom_byte_mask, search_direction;
++
++   // initialize for search
++   id_bit_number = 1;
++   last_zero = 0;
++   rom_byte_number = 0;
++   rom_byte_mask = 1;
++   search_result = false;
++
++   // if the last call was not the last one
++   if (!LastDeviceFlag) {
++      // 1-Wire reset
++      if (!reset()) {
++         // reset the search
++         LastDiscrepancy = 0;
++         LastDeviceFlag = false;
++         LastFamilyDiscrepancy = 0;
++         return false;
++      }
++
++      // issue the search command
++      if (search_mode == true) {
++        write(0xF0);   // NORMAL SEARCH
++      } else {
++        write(0xEC);   // CONDITIONAL SEARCH
++      }
++
++      // loop to do the search
++      do
++      {
++         // read a bit and its complement
++         id_bit = read_bit();
++         cmp_id_bit = read_bit();
++
++         // check for no devices on 1-wire
++         if ((id_bit == 1) && (cmp_id_bit == 1)) {
++            break;
++         } else {
++            // all devices coupled have 0 or 1
++            if (id_bit != cmp_id_bit) {
++               search_direction = id_bit;  // bit write value for search
++            } else {
++               // if this discrepancy if before the Last Discrepancy
++               // on a previous next then pick the same as last time
++               if (id_bit_number < LastDiscrepancy) {
++                  search_direction = ((ROM_NO[rom_byte_number] & rom_byte_mask) > 0);
++               } else {
++                  // if equal to last pick 1, if not then pick 0
++                  search_direction = (id_bit_number == LastDiscrepancy);
++               }
++               // if 0 was picked then record its position in LastZero
++               if (search_direction == 0) {
++                  last_zero = id_bit_number;
++
++                  // check for Last discrepancy in family
++                  if (last_zero < 9)
++                     LastFamilyDiscrepancy = last_zero;
++               }
++            }
++
++            // set or clear the bit in the ROM byte rom_byte_number
++            // with mask rom_byte_mask
++            if (search_direction == 1)
++              ROM_NO[rom_byte_number] |= rom_byte_mask;
++            else
++              ROM_NO[rom_byte_number] &= ~rom_byte_mask;
++
++            // serial number search direction write bit
++            write_bit(search_direction);
++
++            // increment the byte counter id_bit_number
++            // and shift the mask rom_byte_mask
++            id_bit_number++;
++            rom_byte_mask <<= 1;
++
++            // if the mask is 0 then go to new SerialNum byte rom_byte_number and reset mask
++            if (rom_byte_mask == 0) {
++                rom_byte_number++;
++                rom_byte_mask = 1;
++            }
++         }
++      }
++      while(rom_byte_number < 8);  // loop until through all ROM bytes 0-7
++
++      // if the search was successful then
++      if (!(id_bit_number < 65)) {
++         // search successful so set LastDiscrepancy,LastDeviceFlag,search_result
++         LastDiscrepancy = last_zero;
++
++         // check for last device
++         if (LastDiscrepancy == 0) {
++            LastDeviceFlag = true;
++         }
++         search_result = true;
++      }
++   }
++
++   // if no device found then reset counters so next 'search' will be like a first
++   if (!search_result || !ROM_NO[0]) {
++      LastDiscrepancy = 0;
++      LastDeviceFlag = false;
++      LastFamilyDiscrepancy = 0;
++      search_result = false;
++   } else {
++      for (int i = 0; i < 8; i++) newAddr[i] = ROM_NO[i];
++   }
++   return search_result;
++  }
++
++#endif
++
++#if ONEWIRE_CRC
++// The 1-Wire CRC scheme is described in Maxim Application Note 27:
++// "Understanding and Using Cyclic Redundancy Checks with Maxim iButton Products"
++//
++
++#if ONEWIRE_CRC8_TABLE
++// Dow-CRC using polynomial X^8 + X^5 + X^4 + X^0
++// Tiny 2x16 entry CRC table created by Arjen Lentz
++// See http://lentz.com.au/blog/calculating-crc-with-a-tiny-32-entry-lookup-table
++static const uint8_t PROGMEM dscrc2x16_table[] = {
++	0x00, 0x5E, 0xBC, 0xE2, 0x61, 0x3F, 0xDD, 0x83,
++	0xC2, 0x9C, 0x7E, 0x20, 0xA3, 0xFD, 0x1F, 0x41,
++	0x00, 0x9D, 0x23, 0xBE, 0x46, 0xDB, 0x65, 0xF8,
++	0x8C, 0x11, 0xAF, 0x32, 0xCA, 0x57, 0xE9, 0x74
++};
++
++// Compute a Dallas Semiconductor 8 bit CRC. These show up in the ROM
++// and the registers.  (Use tiny 2x16 entry CRC table)
++uint8_t OneWire::crc8(const uint8_t *addr, uint8_t len)
++{
++	uint8_t crc = 0;
++
++	while (len--) {
++		crc = *addr++ ^ crc;  // just re-using crc as intermediate
++		crc = pgm_read_byte(dscrc2x16_table + (crc & 0x0f)) ^
++		pgm_read_byte(dscrc2x16_table + 16 + ((crc >> 4) & 0x0f));
++	}
++
++	return crc;
++}
++#else
++//
++// Compute a Dallas Semiconductor 8 bit CRC directly.
++// this is much slower, but a little smaller, than the lookup table.
++//
++uint8_t OneWire::crc8(const uint8_t *addr, uint8_t len)
++{
++	uint8_t crc = 0;
++
++	while (len--) {
++#if defined(__AVR__)
++		crc = _crc_ibutton_update(crc, *addr++);
++#else
++		uint8_t inbyte = *addr++;
++		for (uint8_t i = 8; i; i--) {
++			uint8_t mix = (crc ^ inbyte) & 0x01;
++			crc >>= 1;
++			if (mix) crc ^= 0x8C;
++			inbyte >>= 1;
++		}
++#endif
++	}
++	return crc;
++}
++#endif
++
++#if ONEWIRE_CRC16
++bool OneWire::check_crc16(const uint8_t* input, uint16_t len, const uint8_t* inverted_crc, uint16_t crc)
++{
++    crc = ~crc16(input, len, crc);
++    return (crc & 0xFF) == inverted_crc[0] && (crc >> 8) == inverted_crc[1];
++}
++
++uint16_t OneWire::crc16(const uint8_t* input, uint16_t len, uint16_t crc)
++{
++#if defined(__AVR__)
++    for (uint16_t i = 0 ; i < len ; i++) {
++        crc = _crc16_update(crc, input[i]);
++    }
++#else
++    static const uint8_t oddparity[16] =
++        { 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0 };
++
++    for (uint16_t i = 0 ; i < len ; i++) {
++      // Even though we're just copying a byte from the input,
++      // we'll be doing 16-bit computation with it.
++      uint16_t cdata = input[i];
++      cdata = (cdata ^ crc) & 0xff;
++      crc >>= 8;
++
++      if (oddparity[cdata & 0x0F] ^ oddparity[cdata >> 4])
++          crc ^= 0xC001;
++
++      cdata <<= 6;
++      crc ^= cdata;
++      cdata <<= 1;
++      crc ^= cdata;
++    }
++#endif
++    return crc;
++}
++#endif
++
++#endif
+diff --git a/libraries/OneWire/OneWire.h b/libraries/OneWire/OneWire.h
+new file mode 100644
+index 00000000..a7bfab74
+--- /dev/null
++++ b/libraries/OneWire/OneWire.h
+@@ -0,0 +1,182 @@
++#ifndef OneWire_h
++#define OneWire_h
++
++#ifdef __cplusplus
++
++#include <stdint.h>
++
++#if defined(__AVR__)
++#include <util/crc16.h>
++#endif
++
++#if ARDUINO >= 100
++#include <Arduino.h>       // for delayMicroseconds, digitalPinToBitMask, etc
++#else
++#include "WProgram.h"      // for delayMicroseconds
++#include "pins_arduino.h"  // for digitalPinToBitMask, etc
++#endif
++
++// You can exclude certain features from OneWire.  In theory, this
++// might save some space.  In practice, the compiler automatically
++// removes unused code (technically, the linker, using -fdata-sections
++// and -ffunction-sections when compiling, and Wl,--gc-sections
++// when linking), so most of these will not result in any code size
++// reduction.  Well, unless you try to use the missing features
++// and redesign your program to not need them!  ONEWIRE_CRC8_TABLE
++// is the exception, because it selects a fast but large algorithm
++// or a small but slow algorithm.
++
++// you can exclude onewire_search by defining that to 0
++#ifndef ONEWIRE_SEARCH
++#define ONEWIRE_SEARCH 1
++#endif
++
++// You can exclude CRC checks altogether by defining this to 0
++#ifndef ONEWIRE_CRC
++#define ONEWIRE_CRC 1
++#endif
++
++// Select the table-lookup method of computing the 8-bit CRC
++// by setting this to 1.  The lookup table enlarges code size by
++// about 250 bytes.  It does NOT consume RAM (but did in very
++// old versions of OneWire).  If you disable this, a slower
++// but very compact algorithm is used.
++#ifndef ONEWIRE_CRC8_TABLE
++#define ONEWIRE_CRC8_TABLE 1
++#endif
++
++// You can allow 16-bit CRC checks by defining this to 1
++// (Note that ONEWIRE_CRC must also be 1.)
++#ifndef ONEWIRE_CRC16
++#define ONEWIRE_CRC16 1
++#endif
++
++// Board-specific macros for direct GPIO
++#include "util/OneWire_direct_regtype.h"
++
++class OneWire
++{
++  private:
++    IO_REG_TYPE bitmask;
++    volatile IO_REG_TYPE *baseReg;
++
++#if ONEWIRE_SEARCH
++    // global search state
++    unsigned char ROM_NO[8];
++    uint8_t LastDiscrepancy;
++    uint8_t LastFamilyDiscrepancy;
++    bool LastDeviceFlag;
++#endif
++
++  public:
++    OneWire() { }
++    OneWire(uint8_t pin) { begin(pin); }
++    void begin(uint8_t pin);
++
++    // Perform a 1-Wire reset cycle. Returns 1 if a device responds
++    // with a presence pulse.  Returns 0 if there is no device or the
++    // bus is shorted or otherwise held low for more than 250uS
++    uint8_t reset(void);
++
++    // Issue a 1-Wire rom select command, you do the reset first.
++    void select(const uint8_t rom[8]);
++
++    // Issue a 1-Wire rom skip command, to address all on bus.
++    void skip(void);
++
++    // Write a byte. If 'power' is one then the wire is held high at
++    // the end for parasitically powered devices. You are responsible
++    // for eventually depowering it by calling depower() or doing
++    // another read or write.
++    void write(uint8_t v, uint8_t power = 0);
++
++    void write_bytes(const uint8_t *buf, uint16_t count, bool power = 0);
++
++    // Read a byte.
++    uint8_t read(void);
++
++    void read_bytes(uint8_t *buf, uint16_t count);
++
++    // Write a bit. The bus is always left powered at the end, see
++    // note in write() about that.
++    void write_bit(uint8_t v);
++
++    // Read a bit.
++    uint8_t read_bit(void);
++
++    // Stop forcing power onto the bus. You only need to do this if
++    // you used the 'power' flag to write() or used a write_bit() call
++    // and aren't about to do another read or write. You would rather
++    // not leave this powered if you don't have to, just in case
++    // someone shorts your bus.
++    void depower(void);
++
++#if ONEWIRE_SEARCH
++    // Clear the search state so that if will start from the beginning again.
++    void reset_search();
++
++    // Setup the search to find the device type 'family_code' on the next call
++    // to search(*newAddr) if it is present.
++    void target_search(uint8_t family_code);
++
++    // Look for the next device. Returns 1 if a new address has been
++    // returned. A zero might mean that the bus is shorted, there are
++    // no devices, or you have already retrieved all of them.  It
++    // might be a good idea to check the CRC to make sure you didn't
++    // get garbage.  The order is deterministic. You will always get
++    // the same devices in the same order.
++    bool search(uint8_t *newAddr, bool search_mode = true);
++#endif
++
++#if ONEWIRE_CRC
++    // Compute a Dallas Semiconductor 8 bit CRC, these are used in the
++    // ROM and scratchpad registers.
++    static uint8_t crc8(const uint8_t *addr, uint8_t len);
++
++#if ONEWIRE_CRC16
++    // Compute the 1-Wire CRC16 and compare it against the received CRC.
++    // Example usage (reading a DS2408):
++    //    // Put everything in a buffer so we can compute the CRC easily.
++    //    uint8_t buf[13];
++    //    buf[0] = 0xF0;    // Read PIO Registers
++    //    buf[1] = 0x88;    // LSB address
++    //    buf[2] = 0x00;    // MSB address
++    //    WriteBytes(net, buf, 3);    // Write 3 cmd bytes
++    //    ReadBytes(net, buf+3, 10);  // Read 6 data bytes, 2 0xFF, 2 CRC16
++    //    if (!CheckCRC16(buf, 11, &buf[11])) {
++    //        // Handle error.
++    //    }     
++    //          
++    // @param input - Array of bytes to checksum.
++    // @param len - How many bytes to use.
++    // @param inverted_crc - The two CRC16 bytes in the received data.
++    //                       This should just point into the received data,
++    //                       *not* at a 16-bit integer.
++    // @param crc - The crc starting value (optional)
++    // @return True, iff the CRC matches.
++    static bool check_crc16(const uint8_t* input, uint16_t len, const uint8_t* inverted_crc, uint16_t crc = 0);
++
++    // Compute a Dallas Semiconductor 16 bit CRC.  This is required to check
++    // the integrity of data received from many 1-Wire devices.  Note that the
++    // CRC computed here is *not* what you'll get from the 1-Wire network,
++    // for two reasons:
++    //   1) The CRC is transmitted bitwise inverted.
++    //   2) Depending on the endian-ness of your processor, the binary
++    //      representation of the two-byte return value may have a different
++    //      byte order than the two bytes you get from 1-Wire.
++    // @param input - Array of bytes to checksum.
++    // @param len - How many bytes to use.
++    // @param crc - The crc starting value (optional)
++    // @return The CRC16, as defined by Dallas Semiconductor.
++    static uint16_t crc16(const uint8_t* input, uint16_t len, uint16_t crc = 0);
++#endif
++#endif
++};
++
++// Prevent this name from leaking into Arduino sketches
++#ifdef IO_REG_TYPE
++#undef IO_REG_TYPE
++#endif
++
++#endif // __cplusplus
++#endif // OneWire_h
+diff --git a/libraries/OneWire/examples/DS18x20_Temperature/DS18x20_Temperature.ino b/libraries/OneWire/examples/DS18x20_Temperature/DS18x20_Temperature.ino
+new file mode 100644
+index 00000000..34a5e448
+--- /dev/null
++++ b/libraries/OneWire/examples/DS18x20_Temperature/DS18x20_Temperature.ino
+@@ -0,0 +1,112 @@
++#include <OneWire.h>
++
++// OneWire DS18S20, DS18B20, DS1822 Temperature Example
++//
++// http://www.pjrc.com/teensy/td_libs_OneWire.html
++//
++// The DallasTemperature library can do all this work for you!
++// https://github.com/milesburton/Arduino-Temperature-Control-Library
++
++OneWire  ds(10);  // on pin 10 (a 4.7K resistor is necessary)
++
++void setup(void) {
++  Serial.begin(9600);
++}
++
++void loop(void) {
++  byte i;
++  byte present = 0;
++  byte type_s;
++  byte data[9];
++  byte addr[8];
++  float celsius, fahrenheit;
++  
++  if ( !ds.search(addr)) {
++    Serial.println("No more addresses.");
++    Serial.println();
++    ds.reset_search();
++    delay(250);
++    return;
++  }
++  
++  Serial.print("ROM =");
++  for( i = 0; i < 8; i++) {
++    Serial.write(' ');
++    Serial.print(addr[i], HEX);
++  }
++
++  if (OneWire::crc8(addr, 7) != addr[7]) {
++      Serial.println("CRC is not valid!");
++      return;
++  }
++  Serial.println();
++ 
++  // the first ROM byte indicates which chip
++  switch (addr[0]) {
++    case 0x10:
++      Serial.println("  Chip = DS18S20");  // or old DS1820
++      type_s = 1;
++      break;
++    case 0x28:
++      Serial.println("  Chip = DS18B20");
++      type_s = 0;
++      break;
++    case 0x22:
++      Serial.println("  Chip = DS1822");
++      type_s = 0;
++      break;
++    default:
++      Serial.println("Device is not a DS18x20 family device.");
++      return;
++  } 
++
++  ds.reset();
++  ds.select(addr);
++  ds.write(0x44, 1);        // start conversion, with parasite power on at the end
++  
++  delay(1000);     // maybe 750ms is enough, maybe not
++  // we might do a ds.depower() here, but the reset will take care of it.
++  
++  present = ds.reset();
++  ds.select(addr);    
++  ds.write(0xBE);         // Read Scratchpad
++
++  Serial.print("  Data = ");
++  Serial.print(present, HEX);
++  Serial.print(" ");
++  for ( i = 0; i < 9; i++) {           // we need 9 bytes
++    data[i] = ds.read();
++    Serial.print(data[i], HEX);
++    Serial.print(" ");
++  }
++  Serial.print(" CRC=");
++  Serial.print(OneWire::crc8(data, 8), HEX);
++  Serial.println();
++
++  // Convert the data to actual temperature
++  // because the result is a 16 bit signed integer, it should
++  // be stored to an "int16_t" type, which is always 16 bits
++  // even when compiled on a 32 bit processor.
++  int16_t raw = (data[1] << 8) | data[0];
++  if (type_s) {
++    raw = raw << 3; // 9 bit resolution default
++    if (data[7] == 0x10) {
++      // "count remain" gives full 12 bit resolution
++      raw = (raw & 0xFFF0) + 12 - data[6];
++    }
++  } else {
++    byte cfg = (data[4] & 0x60);
++    // at lower res, the low bits are undefined, so let's zero them
++    if (cfg == 0x00) raw = raw & ~7;  // 9 bit resolution, 93.75 ms
++    else if (cfg == 0x20) raw = raw & ~3; // 10 bit res, 187.5 ms
++    else if (cfg == 0x40) raw = raw & ~1; // 11 bit res, 375 ms
++    //// default is 12 bit resolution, 750 ms conversion time
++  }
++  celsius = (float)raw / 16.0;
++  fahrenheit = celsius * 1.8 + 32.0;
++  Serial.print("  Temperature = ");
++  Serial.print(celsius);
++  Serial.print(" Celsius, ");
++  Serial.print(fahrenheit);
++  Serial.println(" Fahrenheit");
++}
+diff --git a/libraries/OneWire/examples/DS2408_Switch/DS2408_Switch.ino b/libraries/OneWire/examples/DS2408_Switch/DS2408_Switch.ino
+new file mode 100644
+index 00000000..b70eda97
+--- /dev/null
++++ b/libraries/OneWire/examples/DS2408_Switch/DS2408_Switch.ino
+@@ -0,0 +1,74 @@
++#include <OneWire.h>
++
++/*
++ * DS2408 8-Channel Addressable Switch
++ *
++ * Writte by Glenn Trewitt, glenn at trewitt dot org
++ *
++ * Some notes about the DS2408:
++ *   - Unlike most input/output ports, the DS2408 doesn't have mode bits to
++ *       set whether the pins are input or output.  If you issue a read command,
++ *       they're inputs.  If you write to them, they're outputs.
++ *   - For reading from a switch, you should use 10K pull-up resisters.
++ */
++
++OneWire net(10);  // on pin 10
++
++
++void PrintBytes(const uint8_t* addr, uint8_t count, bool newline=false) {
++  for (uint8_t i = 0; i < count; i++) {
++    Serial.print(addr[i]>>4, HEX);
++    Serial.print(addr[i]&0x0f, HEX);
++  }
++  if (newline)
++    Serial.println();
++}
++
++
++void setup(void) {
++  Serial.begin(9600);
++}
++
++void loop(void) {
++  byte addr[8];
++
++  if (!net.search(addr)) {
++    Serial.print("No more addresses.\n");
++    net.reset_search();
++    delay(1000);
++    return;
++  }
++
++  if (OneWire::crc8(addr, 7) != addr[7]) {
++    Serial.print("CRC is not valid!\n");
++    return;
++  }
++
++  if (addr[0] != 0x29) {
++    PrintBytes(addr, 8);
++    Serial.print(" is not a DS2408.\n");
++    return;
++  }
++
++  Serial.print("  Reading DS2408 ");
++  PrintBytes(addr, 8);
++  Serial.println();
++
++  uint8_t buf[13];  // Put everything in the buffer so we can compute CRC easily.
++  buf[0] = 0xF0;    // Read PIO Registers
++  buf[1] = 0x88;    // LSB address
++  buf[2] = 0x00;    // MSB address
++  net.write_bytes(buf, 3);
++  net.read_bytes(buf+3, 10);     // 3 cmd bytes, 6 data bytes, 2 0xFF, 2 CRC16
++  net.reset();
++
++  if (!OneWire::check_crc16(buf, 11, &buf[11])) {
++    Serial.print("CRC failure in DS2408 at ");
++    PrintBytes(addr, 8, true);
++    return;
++  }
++  Serial.print("  DS2408 data = ");
++  // First 3 bytes contain command, register address.
++  Serial.println(buf[3], BIN);
++}
++
+diff --git a/libraries/OneWire/examples/DS250x_PROM/DS250x_PROM.ino b/libraries/OneWire/examples/DS250x_PROM/DS250x_PROM.ino
+new file mode 100644
+index 00000000..db95a5e9
+--- /dev/null
++++ b/libraries/OneWire/examples/DS250x_PROM/DS250x_PROM.ino
+@@ -0,0 +1,75 @@
++/*
++DS250x add-only programmable memory reader w/SKIP ROM.
++
++ The DS250x is a 512/1024bit add-only PROM(you can add data but cannot change the old one) that's used mainly for device identification purposes
++ like serial number, mfgr data, unique identifiers, etc. It uses the Maxim 1-wire bus.
++
++ This sketch will use the SKIP ROM function that skips the 1-Wire search phase since we only have one device connected in the bus on digital pin 6.
++ If more than one device is connected to the bus, it will fail.
++ Sketch will not verify if device connected is from the DS250x family since the skip rom function effectively skips the family-id byte readout.
++ thus it is possible to run this sketch with any Maxim OneWire device in which case the command CRC will most likely fail.
++ Sketch will only read the first page of memory(32bits) starting from the lower address(0000h), if more than 1 device is present, then use the sketch with search functions.
++ Remember to put a 4.7K pullup resistor between pin 6 and +Vcc
++
++ To change the range or ammount of data to read, simply change the data array size, LSB/MSB addresses and for loop iterations
++
++ This example code is in the public domain and is provided AS-IS.
++
++ Built with Arduino 0022 and PJRC OneWire 2.0 library http://www.pjrc.com/teensy/td_libs_OneWire.html
++
++ created by Guillermo Lovato <glovato@gmail.com>
++ march/2011
++
++ */
++
++#include <OneWire.h>
++OneWire ds(6);                    // OneWire bus on digital pin 6
++void setup() {
++  Serial.begin (9600);
++}
++
++void loop() {
++  byte i;                         // This is for the for loops
++  boolean present;                // device present var
++  byte data[32];                  // container for the data from device
++  byte leemem[3] = {              // array with the commands to initiate a read, DS250x devices expect 3 bytes to start a read: command,LSB&MSB adresses
++    0xF0 , 0x00 , 0x00   };       // 0xF0 is the Read Data command, followed by 00h 00h as starting address(the beginning, 0000h)
++  byte ccrc;                      // Variable to store the command CRC
++  byte ccrc_calc;
++
++  present = ds.reset();           // OneWire bus reset, always needed to start operation on the bus, returns a 1/TRUE if there's a device present.
++  ds.skip();                      // Skip ROM search
++
++  if (present == true) {          // We only try to read the data if there's a device present
++    Serial.println("DS250x device present");
++    ds.write(leemem[0],1);        // Read data command, leave ghost power on
++    ds.write(leemem[1],1);        // LSB starting address, leave ghost power on
++    ds.write(leemem[2],1);        // MSB starting address, leave ghost power on
++
++    ccrc = ds.read();             // DS250x generates a CRC for the command we sent, we assign a read slot and store it's value
++    ccrc_calc = OneWire::crc8(leemem, 3);  // We calculate the CRC of the commands we sent using the library function and store it
++
++    if ( ccrc_calc != ccrc) {      // Then we compare it to the value the ds250x calculated, if it fails, we print debug messages and abort
++      Serial.println("Invalid command CRC!");
++      Serial.print("Calculated CRC:");
++      Serial.println(ccrc_calc,HEX);    // HEX makes it easier to observe and compare
++      Serial.print("DS250x readback CRC:");
++      Serial.println(ccrc,HEX);
++      return;                      // Since CRC failed, we abort the rest of the loop and start over
++    }
++    Serial.println("Data is: ");   // For the printout of the data
++    for ( i = 0; i < 32; i++) {    // Now it's time to read the PROM data itself, each page is 32 bytes so we need 32 read commands
++      data[i] = ds.read();         // we store each read byte to a different position in the data array
++      Serial.print(data[i]);       // printout in ASCII
++      Serial.print(" ");           // blank space
++    }
++    Serial.println();
++    delay(5000);                    // Delay so we don't saturate the serial output
++  }
++  else {                           // Nothing is connected in the bus
++    Serial.println("Nothing connected");
++    delay(3000);
++  }
++}
++
++
+diff --git a/libraries/OneWire/keywords.txt b/libraries/OneWire/keywords.txt
+new file mode 100644
+index 00000000..bee5d90b
+--- /dev/null
++++ b/libraries/OneWire/keywords.txt
+@@ -0,0 +1,38 @@
++#######################################
++# Syntax Coloring Map For OneWire
++#######################################
++
++#######################################
++# Datatypes (KEYWORD1)
++#######################################
++
++OneWire	KEYWORD1
++
++#######################################
++# Methods and Functions (KEYWORD2)
++#######################################
++
++reset	KEYWORD2
++write_bit	KEYWORD2
++read_bit	KEYWORD2
++write	KEYWORD2
++write_bytes	KEYWORD2
++read	KEYWORD2
++read_bytes	KEYWORD2
++select	KEYWORD2
++skip	KEYWORD2
++depower	KEYWORD2
++reset_search	KEYWORD2
++search	KEYWORD2
++crc8	KEYWORD2
++crc16	KEYWORD2
++check_crc16	KEYWORD2
++
++#######################################
++# Instances (KEYWORD2)
++#######################################
++
++
++#######################################
++# Constants (LITERAL1)
++#######################################
+diff --git a/libraries/OneWire/library.json b/libraries/OneWire/library.json
+new file mode 100644
+index 00000000..f370f06f
+--- /dev/null
++++ b/libraries/OneWire/library.json
+@@ -0,0 +1,61 @@
++{
++    "name": "OneWire",
++    "description": "Control 1-Wire protocol (DS18S20, DS18B20, DS2408 and etc)",
++    "keywords": "onewire, 1-wire, bus, sensor, temperature, ibutton",
++    "authors": [
++        {
++            "name": "Paul Stoffregen",
++            "email": "paul@pjrc.com",
++            "url": "http://www.pjrc.com",
++            "maintainer": true
++        },
++        {
++            "name": "Jim Studt"
++        },
++        {
++            "name": "Tom Pollard",
++            "email": "pollard@alum.mit.edu"
++        },
++        {
++            "name": "Derek Yerger"
++        },
++        {
++            "name": "Josh Larios"
++        },
++        {
++            "name": "Robin James"
++        },
++        {
++            "name": "Glenn Trewitt"
++        },
++        {
++            "name": "Jason Dangel",
++            "email": "dangel.jason AT gmail.com"
++        },
++        {
++            "name": "Guillermo Lovato"
++        },
++        {
++            "name": "Ken Butcher"
++        },
++        {
++            "name": "Mark Tillotson"
++        },
++        {
++            "name": "Bertrik Sikken"
++        },
++        {
++            "name": "Scott Roberts"
++        }
++    ],
++    "repository": {
++        "type": "git",
++        "url": "https://github.com/PaulStoffregen/OneWire"
++    },
++    "version": "2.3.7",
++    "homepage": "https://www.pjrc.com/teensy/td_libs_OneWire.html",
++    "frameworks": "Arduino",
++    "examples": [
++        "examples/*/*.pde"
++    ]
++}
+diff --git a/libraries/OneWire/library.properties b/libraries/OneWire/library.properties
+new file mode 100644
+index 00000000..5256ce47
+--- /dev/null
++++ b/libraries/OneWire/library.properties
+@@ -0,0 +1,10 @@
++name=OneWire
++version=2.3.7
++author=Jim Studt, Tom Pollard, Robin James, Glenn Trewitt, Jason Dangel, Guillermo Lovato, Paul Stoffregen, Scott Roberts, Bertrik Sikken, Mark Tillotson, Ken Butcher, Roger Clark, Love Nystrom
++maintainer=Paul Stoffregen
++sentence=Access 1-wire temperature sensors, memory and other chips.
++paragraph=
++category=Communication
++url=http://www.pjrc.com/teensy/td_libs_OneWire.html
++architectures=*
++
+diff --git a/libraries/OneWire/util/OneWire_direct_gpio.h b/libraries/OneWire/util/OneWire_direct_gpio.h
+new file mode 100644
+index 00000000..435443a8
+--- /dev/null
++++ b/libraries/OneWire/util/OneWire_direct_gpio.h
+@@ -0,0 +1,445 @@
++#ifndef OneWire_Direct_GPIO_h
++#define OneWire_Direct_GPIO_h
++
++// This header should ONLY be included by OneWire.cpp.  These defines are
++// meant to be private, used within OneWire.cpp, but not exposed to Arduino
++// sketches or other libraries which may include OneWire.h.
++
++#include <stdint.h>
++
++// Platform specific I/O definitions
++
++#if defined(__AVR__)
++#define PIN_TO_BASEREG(pin)             (portInputRegister(digitalPinToPort(pin)))
++#define PIN_TO_BITMASK(pin)             (digitalPinToBitMask(pin))
++#define IO_REG_TYPE uint8_t
++#define IO_REG_BASE_ATTR asm("r30")
++#define IO_REG_MASK_ATTR
++#if defined(__AVR_ATmega4809__)
++#define DIRECT_READ(base, mask)         (((*(base)) & (mask)) ? 1 : 0)
++#define DIRECT_MODE_INPUT(base, mask)   ((*((base)-8)) &= ~(mask))
++#define DIRECT_MODE_OUTPUT(base, mask)  ((*((base)-8)) |= (mask))
++#define DIRECT_WRITE_LOW(base, mask)    ((*((base)-4)) &= ~(mask))
++#define DIRECT_WRITE_HIGH(base, mask)   ((*((base)-4)) |= (mask))
++#else
++#define DIRECT_READ(base, mask)         (((*(base)) & (mask)) ? 1 : 0)
++#define DIRECT_MODE_INPUT(base, mask)   ((*((base)+1)) &= ~(mask))
++#define DIRECT_MODE_OUTPUT(base, mask)  ((*((base)+1)) |= (mask))
++#define DIRECT_WRITE_LOW(base, mask)    ((*((base)+2)) &= ~(mask))
++#define DIRECT_WRITE_HIGH(base, mask)   ((*((base)+2)) |= (mask))
++#endif
++
++#elif defined(__MK20DX128__) || defined(__MK20DX256__) || defined(__MK66FX1M0__) || defined(__MK64FX512__)
++#define PIN_TO_BASEREG(pin)             (portOutputRegister(pin))
++#define PIN_TO_BITMASK(pin)             (1)
++#define IO_REG_TYPE uint8_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR __attribute__ ((unused))
++#define DIRECT_READ(base, mask)         (*((base)+512))
++#define DIRECT_MODE_INPUT(base, mask)   (*((base)+640) = 0)
++#define DIRECT_MODE_OUTPUT(base, mask)  (*((base)+640) = 1)
++#define DIRECT_WRITE_LOW(base, mask)    (*((base)+256) = 1)
++#define DIRECT_WRITE_HIGH(base, mask)   (*((base)+128) = 1)
++
++#elif defined(__MKL26Z64__)
++#define PIN_TO_BASEREG(pin)             (portOutputRegister(pin))
++#define PIN_TO_BITMASK(pin)             (digitalPinToBitMask(pin))
++#define IO_REG_TYPE uint8_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, mask)         ((*((base)+16) & (mask)) ? 1 : 0)
++#define DIRECT_MODE_INPUT(base, mask)   (*((base)+20) &= ~(mask))
++#define DIRECT_MODE_OUTPUT(base, mask)  (*((base)+20) |= (mask))
++#define DIRECT_WRITE_LOW(base, mask)    (*((base)+8) = (mask))
++#define DIRECT_WRITE_HIGH(base, mask)   (*((base)+4) = (mask))
++
++#elif defined(__IMXRT1052__) || defined(__IMXRT1062__)
++#define PIN_TO_BASEREG(pin)             (portOutputRegister(pin))
++#define PIN_TO_BITMASK(pin)             (digitalPinToBitMask(pin))
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, mask)         ((*((base)+2) & (mask)) ? 1 : 0)
++#define DIRECT_MODE_INPUT(base, mask)   (*((base)+1) &= ~(mask))
++#define DIRECT_MODE_OUTPUT(base, mask)  (*((base)+1) |= (mask))
++#define DIRECT_WRITE_LOW(base, mask)    (*((base)+34) = (mask))
++#define DIRECT_WRITE_HIGH(base, mask)   (*((base)+33) = (mask))
++
++#elif defined(__SAM3X8E__) || defined(__SAM3A8C__) || defined(__SAM3A4C__)
++// Arduino 1.5.1 may have a bug in delayMicroseconds() on Arduino Due.
++// http://arduino.cc/forum/index.php/topic,141030.msg1076268.html#msg1076268
++// If you have trouble with OneWire on Arduino Due, please check the
++// status of delayMicroseconds() before reporting a bug in OneWire!
++#define PIN_TO_BASEREG(pin)             (&(digitalPinToPort(pin)->PIO_PER))
++#define PIN_TO_BITMASK(pin)             (digitalPinToBitMask(pin))
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, mask)         (((*((base)+15)) & (mask)) ? 1 : 0)
++#define DIRECT_MODE_INPUT(base, mask)   ((*((base)+5)) = (mask))
++#define DIRECT_MODE_OUTPUT(base, mask)  ((*((base)+4)) = (mask))
++#define DIRECT_WRITE_LOW(base, mask)    ((*((base)+13)) = (mask))
++#define DIRECT_WRITE_HIGH(base, mask)   ((*((base)+12)) = (mask))
++#ifndef PROGMEM
++#define PROGMEM
++#endif
++#ifndef pgm_read_byte
++#define pgm_read_byte(addr) (*(const uint8_t *)(addr))
++#endif
++
++#elif defined(__PIC32MX__)
++#define PIN_TO_BASEREG(pin)             (portModeRegister(digitalPinToPort(pin)))
++#define PIN_TO_BITMASK(pin)             (digitalPinToBitMask(pin))
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, mask)         (((*(base+4)) & (mask)) ? 1 : 0)  //PORTX + 0x10
++#define DIRECT_MODE_INPUT(base, mask)   ((*(base+2)) = (mask))            //TRISXSET + 0x08
++#define DIRECT_MODE_OUTPUT(base, mask)  ((*(base+1)) = (mask))            //TRISXCLR + 0x04
++#define DIRECT_WRITE_LOW(base, mask)    ((*(base+8+1)) = (mask))          //LATXCLR  + 0x24
++#define DIRECT_WRITE_HIGH(base, mask)   ((*(base+8+2)) = (mask))          //LATXSET + 0x28
++
++#elif defined(ARDUINO_ARCH_ESP8266)
++// Special note: I depend on the ESP community to maintain these definitions and
++// submit good pull requests.  I can not answer any ESP questions or help you
++// resolve any problems related to ESP chips.  Please do not contact me and please
++// DO NOT CREATE GITHUB ISSUES for ESP support.  All ESP questions must be asked
++// on ESP community forums.
++#define PIN_TO_BASEREG(pin)             ((volatile uint32_t*) GPO)
++#define PIN_TO_BITMASK(pin)             (1 << pin)
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, mask)         ((GPI & (mask)) ? 1 : 0)    //GPIO_IN_ADDRESS
++#define DIRECT_MODE_INPUT(base, mask)   (GPE &= ~(mask))            //GPIO_ENABLE_W1TC_ADDRESS
++#define DIRECT_MODE_OUTPUT(base, mask)  (GPE |= (mask))             //GPIO_ENABLE_W1TS_ADDRESS
++#define DIRECT_WRITE_LOW(base, mask)    (GPOC = (mask))             //GPIO_OUT_W1TC_ADDRESS
++#define DIRECT_WRITE_HIGH(base, mask)   (GPOS = (mask))             //GPIO_OUT_W1TS_ADDRESS
++
++#elif defined(ARDUINO_ARCH_ESP32)
++#include <driver/rtc_io.h>
++#define PIN_TO_BASEREG(pin)             (0)
++#define PIN_TO_BITMASK(pin)             (pin)
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++
++static inline __attribute__((always_inline))
++IO_REG_TYPE directRead(IO_REG_TYPE pin)
++{
++#if CONFIG_IDF_TARGET_ESP32C3
++    return (GPIO.in.val >> pin) & 0x1;
++#else // plain ESP32
++    if ( pin < 32 )
++        return (GPIO.in >> pin) & 0x1;
++    else if ( pin < 46 )
++        return (GPIO.in1.val >> (pin - 32)) & 0x1;
++#endif
++
++    return 0;
++}
++
++static inline __attribute__((always_inline))
++void directWriteLow(IO_REG_TYPE pin)
++{
++#if CONFIG_IDF_TARGET_ESP32C3
++    GPIO.out_w1tc.val = ((uint32_t)1 << pin);
++#else // plain ESP32
++    if ( pin < 32 )
++        GPIO.out_w1tc = ((uint32_t)1 << pin);
++    else if ( pin < 46 )
++        GPIO.out1_w1tc.val = ((uint32_t)1 << (pin - 32));
++#endif
++}
++
++static inline __attribute__((always_inline))
++void directWriteHigh(IO_REG_TYPE pin)
++{
++#if CONFIG_IDF_TARGET_ESP32C3
++    GPIO.out_w1ts.val = ((uint32_t)1 << pin);
++#else // plain ESP32
++    if ( pin < 32 )
++        GPIO.out_w1ts = ((uint32_t)1 << pin);
++    else if ( pin < 46 )
++        GPIO.out1_w1ts.val = ((uint32_t)1 << (pin - 32));
++#endif
++}
++
++static inline __attribute__((always_inline))
++void directModeInput(IO_REG_TYPE pin)
++{
++#if CONFIG_IDF_TARGET_ESP32C3
++    GPIO.enable_w1tc.val = ((uint32_t)1 << (pin));
++#else
++    if ( digitalPinIsValid(pin) )
++    {
++#if ESP_IDF_VERSION_MAJOR < 4      // IDF 3.x ESP32/PICO-D4
++        uint32_t rtc_reg(rtc_gpio_desc[pin].reg);
++
++        if ( rtc_reg ) // RTC pins PULL settings
++        {
++            ESP_REG(rtc_reg) = ESP_REG(rtc_reg) & ~(rtc_gpio_desc[pin].mux);
++            ESP_REG(rtc_reg) = ESP_REG(rtc_reg) & ~(rtc_gpio_desc[pin].pullup | rtc_gpio_desc[pin].pulldown);
++        }
++#endif
++	// Input
++        if ( pin < 32 )
++            GPIO.enable_w1tc = ((uint32_t)1 << pin);
++        else
++            GPIO.enable1_w1tc.val = ((uint32_t)1 << (pin - 32));
++    }
++#endif
++}
++
++static inline __attribute__((always_inline))
++void directModeOutput(IO_REG_TYPE pin)
++{
++#if CONFIG_IDF_TARGET_ESP32C3
++    GPIO.enable_w1ts.val = ((uint32_t)1 << (pin));
++#else
++    if ( digitalPinIsValid(pin) && pin <= 33 ) // pins above 33 can be only inputs
++    {
++#if ESP_IDF_VERSION_MAJOR < 4      // IDF 3.x ESP32/PICO-D4
++        uint32_t rtc_reg(rtc_gpio_desc[pin].reg);
++
++        if ( rtc_reg ) // RTC pins PULL settings
++        {
++            ESP_REG(rtc_reg) = ESP_REG(rtc_reg) & ~(rtc_gpio_desc[pin].mux);
++            ESP_REG(rtc_reg) = ESP_REG(rtc_reg) & ~(rtc_gpio_desc[pin].pullup | rtc_gpio_desc[pin].pulldown);
++        }
++#endif
++        // Output
++        if ( pin < 32 )
++            GPIO.enable_w1ts = ((uint32_t)1 << pin);
++        else // already validated to pins <= 33
++            GPIO.enable1_w1ts.val = ((uint32_t)1 << (pin - 32));
++    }
++#endif
++}
++
++#define DIRECT_READ(base, pin)          directRead(pin)
++#define DIRECT_WRITE_LOW(base, pin)     directWriteLow(pin)
++#define DIRECT_WRITE_HIGH(base, pin)    directWriteHigh(pin)
++#define DIRECT_MODE_INPUT(base, pin)    directModeInput(pin)
++#define DIRECT_MODE_OUTPUT(base, pin)   directModeOutput(pin)
++// https://github.com/PaulStoffregen/OneWire/pull/47
++// https://github.com/stickbreaker/OneWire/commit/6eb7fc1c11a15b6ac8c60e5671cf36eb6829f82c
++#ifdef  interrupts
++#undef  interrupts
++#endif
++#ifdef  noInterrupts
++#undef  noInterrupts
++#endif
++#define noInterrupts() {portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;portENTER_CRITICAL(&mux)
++#define interrupts() portEXIT_CRITICAL(&mux);}
++//#warning "ESP32 OneWire testing"
++
++#elif defined(ARDUINO_ARCH_STM32)
++#define PIN_TO_BASEREG(pin)             (0)
++#define PIN_TO_BITMASK(pin)             ((uint32_t)digitalPinToPinName(pin))
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, pin)          digitalReadFast((PinName)pin)
++#define DIRECT_WRITE_LOW(base, pin)     digitalWriteFast((PinName)pin, LOW)
++#define DIRECT_WRITE_HIGH(base, pin)    digitalWriteFast((PinName)pin, HIGH)
++#define DIRECT_MODE_INPUT(base, pin)    pin_function((PinName)pin, STM_PIN_DATA(STM_MODE_INPUT, GPIO_NOPULL, 0))
++#define DIRECT_MODE_OUTPUT(base, pin)   pin_function((PinName)pin, STM_PIN_DATA(STM_MODE_OUTPUT_PP, GPIO_NOPULL, 0))
++
++#elif defined(__SAMD21G18A__)
++#define PIN_TO_BASEREG(pin)             portModeRegister(digitalPinToPort(pin))
++#define PIN_TO_BITMASK(pin)             (digitalPinToBitMask(pin))
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, mask)         (((*((base)+8)) & (mask)) ? 1 : 0)
++#define DIRECT_MODE_INPUT(base, mask)   ((*((base)+1)) = (mask))
++#define DIRECT_MODE_OUTPUT(base, mask)  ((*((base)+2)) = (mask))
++#define DIRECT_WRITE_LOW(base, mask)    ((*((base)+5)) = (mask))
++#define DIRECT_WRITE_HIGH(base, mask)   ((*((base)+6)) = (mask))
++
++#elif defined(__ASR6501__)
++#define PIN_IN_PORT(pin)    (pin % PIN_NUMBER_IN_PORT)
++#define PORT_FROM_PIN(pin)  (pin / PIN_NUMBER_IN_PORT)
++#define PORT_OFFSET(port)   (PORT_REG_SHFIT * port)
++#define PORT_ADDRESS(pin)   (CYDEV_GPIO_BASE + PORT_OFFSET(PORT_FROM_PIN(pin)))
++
++#define PIN_TO_BASEREG(pin)             (0)
++#define PIN_TO_BITMASK(pin)             (pin)
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, pin)          CY_SYS_PINS_READ_PIN(PORT_ADDRESS(pin)+4, PIN_IN_PORT(pin))
++#define DIRECT_WRITE_LOW(base, pin)     CY_SYS_PINS_CLEAR_PIN(PORT_ADDRESS(pin), PIN_IN_PORT(pin))
++#define DIRECT_WRITE_HIGH(base, pin)    CY_SYS_PINS_SET_PIN(PORT_ADDRESS(pin), PIN_IN_PORT(pin))
++#define DIRECT_MODE_INPUT(base, pin)    CY_SYS_PINS_SET_DRIVE_MODE(PORT_ADDRESS(pin)+8, PIN_IN_PORT(pin), CY_SYS_PINS_DM_DIG_HIZ)
++#define DIRECT_MODE_OUTPUT(base, pin)   CY_SYS_PINS_SET_DRIVE_MODE(PORT_ADDRESS(pin)+8, PIN_IN_PORT(pin), CY_SYS_PINS_DM_STRONG)
++
++#elif defined(RBL_NRF51822)
++#define PIN_TO_BASEREG(pin)             (0)
++#define PIN_TO_BITMASK(pin)             (pin)
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, pin)          nrf_gpio_pin_read(pin)
++#define DIRECT_WRITE_LOW(base, pin)     nrf_gpio_pin_clear(pin)
++#define DIRECT_WRITE_HIGH(base, pin)    nrf_gpio_pin_set(pin)
++#define DIRECT_MODE_INPUT(base, pin)    nrf_gpio_cfg_input(pin, NRF_GPIO_PIN_NOPULL)
++#define DIRECT_MODE_OUTPUT(base, pin)   nrf_gpio_cfg_output(pin)
++
++#elif defined(__arc__) /* Arduino101/Genuino101 specifics */
++
++#include "scss_registers.h"
++#include "portable.h"
++#include "avr/pgmspace.h"
++
++#define GPIO_ID(pin)			(g_APinDescription[pin].ulGPIOId)
++#define GPIO_TYPE(pin)			(g_APinDescription[pin].ulGPIOType)
++#define GPIO_BASE(pin)			(g_APinDescription[pin].ulGPIOBase)
++#define DIR_OFFSET_SS			0x01
++#define DIR_OFFSET_SOC			0x04
++#define EXT_PORT_OFFSET_SS		0x0A
++#define EXT_PORT_OFFSET_SOC		0x50
++
++/* GPIO registers base address */
++#define PIN_TO_BASEREG(pin)		((volatile uint32_t *)g_APinDescription[pin].ulGPIOBase)
++#define PIN_TO_BITMASK(pin)		pin
++#define IO_REG_TYPE			uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++
++static inline __attribute__((always_inline))
++IO_REG_TYPE directRead(volatile IO_REG_TYPE *base, IO_REG_TYPE pin)
++{
++    IO_REG_TYPE ret;
++    if (SS_GPIO == GPIO_TYPE(pin)) {
++        ret = READ_ARC_REG(((IO_REG_TYPE)base + EXT_PORT_OFFSET_SS));
++    } else {
++        ret = MMIO_REG_VAL_FROM_BASE((IO_REG_TYPE)base, EXT_PORT_OFFSET_SOC);
++    }
++    return ((ret >> GPIO_ID(pin)) & 0x01);
++}
++
++static inline __attribute__((always_inline))
++void directModeInput(volatile IO_REG_TYPE *base, IO_REG_TYPE pin)
++{
++    if (SS_GPIO == GPIO_TYPE(pin)) {
++        WRITE_ARC_REG(READ_ARC_REG((((IO_REG_TYPE)base) + DIR_OFFSET_SS)) & ~(0x01 << GPIO_ID(pin)),
++			((IO_REG_TYPE)(base) + DIR_OFFSET_SS));
++    } else {
++        MMIO_REG_VAL_FROM_BASE((IO_REG_TYPE)base, DIR_OFFSET_SOC) &= ~(0x01 << GPIO_ID(pin));
++    }
++}
++
++static inline __attribute__((always_inline))
++void directModeOutput(volatile IO_REG_TYPE *base, IO_REG_TYPE pin)
++{
++    if (SS_GPIO == GPIO_TYPE(pin)) {
++        WRITE_ARC_REG(READ_ARC_REG(((IO_REG_TYPE)(base) + DIR_OFFSET_SS)) | (0x01 << GPIO_ID(pin)),
++			((IO_REG_TYPE)(base) + DIR_OFFSET_SS));
++    } else {
++        MMIO_REG_VAL_FROM_BASE((IO_REG_TYPE)base, DIR_OFFSET_SOC) |= (0x01 << GPIO_ID(pin));
++    }
++}
++
++static inline __attribute__((always_inline))
++void directWriteLow(volatile IO_REG_TYPE *base, IO_REG_TYPE pin)
++{
++    if (SS_GPIO == GPIO_TYPE(pin)) {
++        WRITE_ARC_REG(READ_ARC_REG(base) & ~(0x01 << GPIO_ID(pin)), base);
++    } else {
++        MMIO_REG_VAL(base) &= ~(0x01 << GPIO_ID(pin));
++    }
++}
++
++static inline __attribute__((always_inline))
++void directWriteHigh(volatile IO_REG_TYPE *base, IO_REG_TYPE pin)
++{
++    if (SS_GPIO == GPIO_TYPE(pin)) {
++        WRITE_ARC_REG(READ_ARC_REG(base) | (0x01 << GPIO_ID(pin)), base);
++    } else {
++        MMIO_REG_VAL(base) |= (0x01 << GPIO_ID(pin));
++    }
++}
++
++#define DIRECT_READ(base, pin)		directRead(base, pin)
++#define DIRECT_MODE_INPUT(base, pin)	directModeInput(base, pin)
++#define DIRECT_MODE_OUTPUT(base, pin)	directModeOutput(base, pin)
++#define DIRECT_WRITE_LOW(base, pin)	directWriteLow(base, pin)
++#define DIRECT_WRITE_HIGH(base, pin)	directWriteHigh(base, pin)
++
++#elif defined(__riscv)
++
++/*
++ * Tested on highfive1
++ *
++ * Stable results are achieved operating in the
++ * two high speed modes of the highfive1.  It
++ * seems to be less reliable in slow mode.
++ */
++#define PIN_TO_BASEREG(pin)             (0)
++#define PIN_TO_BITMASK(pin)             digitalPinToBitMask(pin)
++#define IO_REG_TYPE uint32_t
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++
++static inline __attribute__((always_inline))
++IO_REG_TYPE directRead(IO_REG_TYPE mask)
++{
++    return ((GPIO_REG(GPIO_INPUT_VAL) & mask) != 0) ? 1 : 0;
++}
++
++static inline __attribute__((always_inline))
++void directModeInput(IO_REG_TYPE mask)
++{
++    GPIO_REG(GPIO_OUTPUT_XOR)  &= ~mask;
++    GPIO_REG(GPIO_IOF_EN)      &= ~mask;
++
++    GPIO_REG(GPIO_INPUT_EN)  |=  mask;
++    GPIO_REG(GPIO_OUTPUT_EN) &= ~mask;
++}
++
++static inline __attribute__((always_inline))
++void directModeOutput(IO_REG_TYPE mask)
++{
++    GPIO_REG(GPIO_OUTPUT_XOR)  &= ~mask;
++    GPIO_REG(GPIO_IOF_EN)      &= ~mask;
++
++    GPIO_REG(GPIO_INPUT_EN)  &= ~mask;
++    GPIO_REG(GPIO_OUTPUT_EN) |=  mask;
++}
++
++static inline __attribute__((always_inline))
++void directWriteLow(IO_REG_TYPE mask)
++{
++    GPIO_REG(GPIO_OUTPUT_VAL) &= ~mask;
++}
++
++static inline __attribute__((always_inline))
++void directWriteHigh(IO_REG_TYPE mask)
++{
++    GPIO_REG(GPIO_OUTPUT_VAL) |= mask;
++}
++
++#define DIRECT_READ(base, mask)          directRead(mask)
++#define DIRECT_WRITE_LOW(base, mask)     directWriteLow(mask)
++#define DIRECT_WRITE_HIGH(base, mask)    directWriteHigh(mask)
++#define DIRECT_MODE_INPUT(base, mask)    directModeInput(mask)
++#define DIRECT_MODE_OUTPUT(base, mask)   directModeOutput(mask)
++
++#else
++#define PIN_TO_BASEREG(pin)             (0)
++#define PIN_TO_BITMASK(pin)             (pin)
++#define IO_REG_TYPE unsigned int
++#define IO_REG_BASE_ATTR
++#define IO_REG_MASK_ATTR
++#define DIRECT_READ(base, pin)          digitalRead(pin)
++#define DIRECT_WRITE_LOW(base, pin)     digitalWrite(pin, LOW)
++#define DIRECT_WRITE_HIGH(base, pin)    digitalWrite(pin, HIGH)
++#define DIRECT_MODE_INPUT(base, pin)    pinMode(pin,INPUT)
++#define DIRECT_MODE_OUTPUT(base, pin)   pinMode(pin,OUTPUT)
++#warning "OneWire. Fallback mode. Using API calls for pinMode,digitalRead and digitalWrite. Operation of this library is not guaranteed on this architecture."
++
++#endif
++
++#endif
+diff --git a/libraries/OneWire/util/OneWire_direct_regtype.h b/libraries/OneWire/util/OneWire_direct_regtype.h
+new file mode 100644
+index 00000000..ca6aff7e
+--- /dev/null
++++ b/libraries/OneWire/util/OneWire_direct_regtype.h
+@@ -0,0 +1,55 @@
++#ifndef OneWire_Direct_RegType_h
++#define OneWire_Direct_RegType_h
++
++#include <stdint.h>
++
++// Platform specific I/O register type
++
++#if defined(__AVR__)
++#define IO_REG_TYPE uint8_t
++
++#elif defined(__MK20DX128__) || defined(__MK20DX256__) || defined(__MK66FX1M0__) || defined(__MK64FX512__)
++#define IO_REG_TYPE uint8_t
++
++#elif defined(__IMXRT1052__) || defined(__IMXRT1062__)
++#define IO_REG_TYPE uint32_t
++
++#elif defined(__MKL26Z64__)
++#define IO_REG_TYPE uint8_t
++
++#elif defined(__SAM3X8E__) || defined(__SAM3A8C__) || defined(__SAM3A4C__)
++#define IO_REG_TYPE uint32_t
++
++#elif defined(__PIC32MX__)
++#define IO_REG_TYPE uint32_t
++
++#elif defined(ARDUINO_ARCH_ESP8266)
++#define IO_REG_TYPE uint32_t
++
++#elif defined(ARDUINO_ARCH_ESP32)
++#define IO_REG_TYPE uint32_t
++#define IO_REG_MASK_ATTR
++
++#elif defined(ARDUINO_ARCH_STM32)
++#define IO_REG_TYPE uint32_t
++
++#elif defined(__SAMD21G18A__)
++#define IO_REG_TYPE uint32_t
++
++#elif defined(__ASR6501__)
++#define IO_REG_TYPE uint32_t
++
++#elif defined(RBL_NRF51822)
++#define IO_REG_TYPE uint32_t
++
++#elif defined(__arc__) /* Arduino101/Genuino101 specifics */
++#define IO_REG_TYPE uint32_t
++
++#elif defined(__riscv)
++#define IO_REG_TYPE uint32_t
++
++#else
++#define IO_REG_TYPE unsigned int
++
++#endif
++#endif
